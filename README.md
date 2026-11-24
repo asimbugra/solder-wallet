@@ -28,6 +28,8 @@ Built on [Infratic-lib](https://github.com/infraticxyz-lab/Infratic-lib), the So
 
 Your phone needs mobile data (or a second network) for balances and sending. Creating a wallet, signing messages and all key handling work with no internet at all.
 
+If transfer confirmation is interrupted, reopen Solder in the same browser and unlock the wallet on the original network. The browser keeps the public signature of each pending transfer and checks its status again. **Check again** looks up the same signature. **Done** returns to the wallet, where pending transfers remain available until confirmed, rejected or removed from tracking.
+
 ## Hardware
 
 | Part | Notes |

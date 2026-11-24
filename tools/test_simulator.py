@@ -177,8 +177,16 @@ class SimulatorTests(unittest.TestCase):
         self.press(1.6)
         signed = json.load(self.call("/api/request?id=" + str(req["id"]), token=token))["request"]
         submission = {"jsonrpc": "2.0", "id": 1, "method": "sendTransaction", "params": [signed["tx"]]}
+        lookup = {"jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
+                  "params": [[signed["signature"]], {"searchTransactionHistory": True}]}
+        with patch.object(self.dev.chain, "lamports", 0):
+            self.assertEqual(json.load(self.call("/rpc", submission))["error"]["code"], -32002)
+        self.assertEqual(json.load(self.call("/rpc", lookup))["result"]["value"], [None])
         for _ in range(2):
             self.assertEqual(json.load(self.call("/rpc", submission))["result"], signed["signature"])
+        self.assertEqual(json.load(self.call("/rpc", lookup))["result"]["value"][0]["confirmationStatus"], "processed")
+        self.clock.return_value += 2
+        self.assertEqual(json.load(self.call("/rpc", lookup))["result"]["value"][0]["confirmationStatus"], "confirmed")
         self.assertEqual(self.dev.chain.lamports, 1_899_995_000)
 
 

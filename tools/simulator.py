@@ -430,7 +430,9 @@ class Handler(BaseHTTPRequestHandler):
                     time.sleep(0.12)
                     self.send_json(200, {"jsonrpc": "2.0", "id": b.get("id"), "result": d.chain.call(b["method"], b.get("params", []))})
                 except Exception as e:  # noqa: BLE001
-                    self.send_json(200, {"jsonrpc": "2.0", "id": b.get("id"), "error": {"code": -32000, "message": str(e)}})
+                    # A refused transfer has a definite preflight result.
+                    code = -32002 if b.get("method") == "sendTransaction" and isinstance(e, ValueError) else -32000
+                    self.send_json(200, {"jsonrpc": "2.0", "id": b.get("id"), "error": {"code": code, "message": str(e)}})
                 return
             if self.restarting():
                 return

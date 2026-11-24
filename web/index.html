@@ -229,7 +229,7 @@ textarea.input { min-height: 120px; resize: vertical; line-height: 1.6; }
 .waiting .a-led { animation: blink .8s steps(1) infinite; }
 @keyframes blink { 50% { fill: var(--led); } }
 .done .a-led { fill: var(--ok); }
-.done .a-flow, .failed .a-flow, .rejected .a-flow { display: none; }
+.done .a-flow, .pending .a-flow, .failed .a-flow, .rejected .a-flow { display: none; }
 .silk { fill: var(--silk); font-family: var(--display); font-weight: 500; font-size: 13px; }
 .silk-dim { fill: var(--silk-dim); font-family: var(--display); font-weight: 500; font-size: 12px; }
 
@@ -396,6 +396,7 @@ textarea.input { min-height: 120px; resize: vertical; line-height: 1.6; }
         <button class="pad" data-go="sign"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M4 20h16M6 16l9.5-9.5a2 2 0 0 1 3 3L9 19l-4 1z"/></svg>Sign</button>
       </div>
       <button class="pad ghost faucet" id="faucetBtn" hidden>Get 1 test SOL</button>
+      <div class="section" id="pendingSection" hidden><h3>Pending transfers</h3><div class="stack" id="pendingList"></div></div>
       <div class="section"><h3>Tokens</h3><ul class="rows" id="tokens"><li><div class="skeleton" style="width:60%"></div></li></ul></div>
       <div class="section"><h3>Activity</h3><ul class="rows" id="activity"><li><div class="skeleton" style="width:80%"></div></li></ul></div>
       <div class="stack"><button class="pad ghost wide" id="lockBtn">Lock</button></div>
@@ -463,7 +464,9 @@ textarea.input { min-height: 120px; resize: vertical; line-height: 1.6; }
       <div class="result" id="result"></div>
       <div class="stack">
         <button class="pad ghost wide" id="rejectBtn">Cancel</button>
+        <button class="pad ghost wide" id="checkTransferBtn" hidden>Check again</button>
         <button class="pad wide" id="doneBtn" hidden>Done</button>
+        <button class="back" id="forgetTransferBtn" hidden>Stop tracking on this browser</button>
       </div>
     </section>
 
@@ -578,7 +581,12 @@ async function rpc(method, params = [], endpoint = state.info.rpc) {
     });
     if (!res.ok) throw new Error("RPC returned HTTP " + res.status);
     const data = await res.json();
-    if (data.error) throw new Error(data.error.message || "RPC error");
+    if (data.error) {
+      const error = new Error(data.error.message || "RPC error");
+      error.rpcCode = data.error.code;
+      error.transactionError = data.error.data?.err;
+      throw error;
+    }
     if (data.jsonrpc !== "2.0" || data.id !== 1 || !Object.hasOwn(data, "result")) throw new Error("Invalid RPC response");
     setOnline(true);
     return data.result;
@@ -606,6 +614,7 @@ function toast(text) {
 let current = "loading";
 function show(name, dir = "fwd", push = true) {
   if (name === current) return;
+  if (current === "approve") trackedTransfer = null;
   if (name === "welcome") forgetSetup();
   if (current === "appass") $("#apPass1").value = $("#apPass2").value = "";
   const from = $("#v-" + current), to = $("#v-" + name);
@@ -679,6 +688,11 @@ function forgetSetup(finished = false) {
 function lockedOut() {
   clearTimeout(poll);
   approvalId = null;
+  approvalProfile = null;
+  trackedTransfer = null;
+  sessionStorage.removeItem("transferApproval");
+  $("#pendingList").replaceChildren();
+  $("#pendingSection").hidden = true;
   state.token = "";
   sessionStorage.removeItem("st");
   forgetSetup(true);
@@ -700,7 +714,7 @@ function route() {
   if (i.hasWallet && !(i.unlocked && state.token)) { lockedOut(); return; }
   if (i.defaultPassword) { $("#apBack").hidden = true; $("#apLede").textContent = "Choose a new password to replace the device’s setup password. Solder restarts to use it."; reset("appass"); return; }
   if (!i.hasWallet) { reset("welcome"); return; }
-  if (i.unlocked && state.token) { reset("home"); return; }
+  if (i.unlocked && state.token) { openWallet(); return; }
   lockedOut();
 }
 
@@ -1009,6 +1023,7 @@ async function loadHome() {
   const i = state.info, token = state.token;
   const stillCurrent = () => token && token === state.token && i.rpc === state.info.rpc;
   if (!stillCurrent()) return;
+  showPendingTransfers();
   $("#addrShort").textContent = shortAddr(i.address);
   $("#faucetBtn").hidden = i.network !== "devnet";
   $("#homeErr").textContent = "";
@@ -1087,6 +1102,7 @@ $("#sendBtn").onclick = async () => {
     const bh = await rpc("getLatestBlockhash", [{ commitment: "confirmed" }], endpoint);
     if (current !== "send" || state.token !== session || endpoint !== state.info.rpc) return;
     const r = await api("send", { to, amount, mint, decimals: t ? t.decimals : 9, program: t ? t.program : undefined, blockhash: bh.value.blockhash });
+    if (current !== "send" || state.token !== session || endpoint !== state.info.rpc) return;
     startApproval(r.request, endpoint);
   } catch (e) { $("#sendErr").textContent = e.message; }
   finally { b.disabled = false; }
@@ -1098,13 +1114,16 @@ $("#signBtn").onclick = async () => {
 };
 
 // ---------- approval -----------------------------------------------------
-let poll = null, traceLen = 0, approvalId = null, approvalEndpoint = "";
+let poll = null, traceLen = 0, approvalId = null, approvalProfile = null;
 function startApproval(req, endpoint = state.info.rpc) {
   clearTimeout(poll);
+  trackedTransfer = null;
   approvalId = req.id;
-  approvalEndpoint = endpoint;
-  const view = $("#v-approve");
-  ["waiting", "working", "done", "failed", "rejected", "expired"].forEach((c) => view.classList.remove(c));
+  approvalProfile = transferProfile(endpoint);
+  if (req.state === "waiting" && (req.kind === "send" || req.kind === "send-token")) {
+    sessionStorage.setItem("transferApproval", transferApprovalKey(req.id, approvalProfile));
+  }
+  $("#checkTransferBtn").hidden = $("#forgetTransferBtn").hidden = true;
   $("#result").textContent = "";
   $("#doneBtn").hidden = true;
   $("#rejectBtn").hidden = false;
@@ -1155,7 +1174,7 @@ function startApproval(req, endpoint = state.info.rpc) {
 
 function setPhase(name) {
   const view = $("#v-approve");
-  ["waiting", "working", "done", "failed", "rejected", "expired"].forEach((c) => view.classList.toggle(c, c === name));
+  ["waiting", "working", "pending", "done", "failed", "rejected", "expired"].forEach((c) => view.classList.toggle(c, c === name));
 }
 
 function paintRequest(r) {
@@ -1175,31 +1194,182 @@ function paintRequest(r) {
   clearTimeout(poll);
   approvalId = null;
   $("#rejectBtn").hidden = true;
-  if (r.state === "done" && r.tx) { broadcast(r, approvalEndpoint); return; }
+  if (r.state === "done" && (r.kind === "send" || r.kind === "send-token")) {
+    if (r.tx && r.signature) { broadcast(r, approvalProfile); return; }
+    r = { ...r, state: "failed", error: "Could not read the signed transfer from Solder." };
+  }
+  sessionStorage.removeItem("transferApproval");
   finish(r);
 }
 
-async function broadcast(r, endpoint) {
-  setPhase("working");
-  const instr = $("#instr");
-  instr.innerHTML = '<span class="spin"></span> Signed on Solder. Sending to the network';
+// Only the public signature and its time are needed to resume. Keep separate
+// entries so one transfer (or another tab) cannot overwrite an earlier one.
+const unsavedTransfers = new Map();
+let trackedTransfer = null;
+function fingerprint(value) {
+  let hash = 0xcbf29ce484222325n;
+  for (const c of value) hash = BigInt.asUintN(64, (hash ^ BigInt(c.charCodeAt(0))) * 0x100000001b3n);
+  return hash.toString(16);
+}
+function transferProfile(endpoint = state.info.rpc) {
+  const { address, network } = state.info;
+  let prefix = "solder.transfer/" + address + "/" + network + "/";
+  if (network === "custom") {
+    // A custom URL can contain a provider key. Store a fingerprint of it.
+    prefix += fingerprint(endpoint) + "/";
+  }
+  return { prefix, endpoint, network };
+}
+function transferApprovalKey(id, profile) { return state.token + "/" + id + "/" + profile.prefix; }
+
+function pendingTransfers(profile) {
+  const entries = new Map(unsavedTransfers);
   try {
-    const sig = await rpc("sendTransaction", [r.tx, { encoding: "base64", preflightCommitment: "confirmed" }], endpoint);
-    if (sig !== r.signature) throw new Error("The RPC returned a different transaction signature. Check the signed transaction in Explorer.");
-    instr.innerHTML = '<span class="spin"></span> Waiting for confirmation';
-    for (let i = 0; i < 40; i++) {
-      const st = await rpc("getSignatureStatuses", [[r.signature]], endpoint);
-      const s = st.value[0];
-      if (s && s.err) throw new Error("The network rejected the transaction");
-      if (s && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")) { finish(r); return; }
-      await sleep(700);
+    for (const key of Object.keys(localStorage)) {
+      if (key.startsWith(profile.prefix)) entries.set(key, Number(localStorage.getItem(key)));
     }
-    finish(Object.assign({}, r, { state: "failed", error: "Not confirmed yet. Check the explorer in a minute.", signature: sig }));
-  } catch (e) {
-    const msg = /blockhash/i.test(e.message) ? "The signature expired before it was sent. Try again a bit faster." : e.message;
-    finish(Object.assign({}, r, { state: "failed", error: msg }));
+  } catch { /* Storage may be disabled. Keep tracking on this page. */ }
+  return [...entries].filter(([key]) => key.startsWith(profile.prefix))
+    .sort((a, b) => b[1] - a[1])
+    .map(([key, time]) => ({ ...profile, signature: key.slice(profile.prefix.length), time }));
+}
+
+function openWallet() {
+  const [latest] = pendingTransfers(transferProfile());
+  if (latest) openTransfer(latest);
+  else reset("home");
+}
+function showPendingTransfers() {
+  const list = $("#pendingList");
+  list.replaceChildren();
+  const entries = pendingTransfers(transferProfile());
+  $("#pendingSection").hidden = !entries.length;
+  for (const transfer of entries) {
+    const b = document.createElement("button");
+    b.className = "pad ghost wide";
+    b.textContent = shortAddr(transfer.signature) + " · " + new Date(transfer.time).toLocaleString();
+    b.onclick = () => openTransfer(transfer);
+    list.appendChild(b);
   }
 }
+function openTransfer(transfer) {
+  trackedTransfer = transfer;
+  $("#sumBox").innerHTML = '<div class="what">Transfer status</div><div class="to"></div>';
+  $("#sumBox .to").textContent = transfer.signature;
+  $("#result").replaceChildren();
+  $("#timer").textContent = "";
+  $("#rejectBtn").hidden = true;
+  $("#aBtn").classList.remove("pressed");
+  $("#stamp").textContent = "Signed";
+  reset("approve");
+  checkTransfer(transfer, true);
+}
+
+function forgetTransfer(transfer) {
+  const key = transfer.prefix + transfer.signature;
+  unsavedTransfers.delete(key);
+  try { localStorage.removeItem(key); } catch { /* In-memory tracking still works. */ }
+}
+function transferResult(transfer, phase, message) {
+  if (trackedTransfer !== transfer) return;
+  if (phase !== "pending") forgetTransfer(transfer);
+  setPhase(phase);
+  $("#instr").textContent = message;
+  $("#checkTransferBtn").hidden = $("#forgetTransferBtn").hidden = phase !== "pending";
+  $("#doneBtn").hidden = false;
+  const result = $("#result");
+  result.replaceChildren();
+  if (transfer.network === "custom") {
+    result.textContent = transfer.signature;
+  } else {
+    const link = document.createElement("a");
+    link.target = "_blank"; link.rel = "noopener";
+    link.href = "https://explorer.solana.com/tx/" + encodeURIComponent(transfer.signature) +
+      (transfer.network === "devnet" ? "?cluster=devnet" : "");
+    link.textContent = "View on Solana Explorer";
+    result.appendChild(link);
+  }
+}
+
+async function checkTransfer(transfer, searchHistory) {
+  setPhase("working");
+  $("#checkTransferBtn").hidden = $("#forgetTransferBtn").hidden = true;
+  $("#doneBtn").hidden = false;
+  $("#instr").textContent = "Checking confirmation…";
+  try {
+    for (let i = 0; i < 40 && trackedTransfer === transfer; i++) {
+      const params = [[transfer.signature]];
+      if (searchHistory && i === 0) params.push({ searchTransactionHistory: true });
+      const status = await rpc("getSignatureStatuses", params, transfer.endpoint);
+      if (trackedTransfer !== transfer) return;
+      const s = status.value[0];
+      if (s && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")) {
+        if (s.err) transferResult(transfer, "failed", "The network rejected this transfer.");
+        else transferResult(transfer, "done", "Sent and confirmed.");
+        return;
+      }
+      $("#instr").textContent = "Awaiting confirmation…";
+      await sleep(700);
+    }
+    transferResult(transfer, "pending", "Confirmation is still pending. Check again before sending another transfer.");
+  } catch (e) {
+    transferResult(transfer, "pending", "Confirmation is unknown. " + e.message);
+  }
+}
+
+async function broadcast(r, profile) {
+  const transfer = { ...profile, signature: r.signature, time: Date.now() };
+  trackedTransfer = transfer;
+  const key = profile.prefix + r.signature;
+  // The board retains its last completed request. A duplicated tab can still
+  // have its pre-broadcast handoff after another tab has observed confirmation.
+  const lastKey = "solder.lastSubmission/" + state.info.apName;
+  const tag = fingerprint(r.signature);
+  let attempted = unsavedTransfers.has(key);
+  try {
+    attempted = attempted || localStorage.getItem(key) !== null || localStorage.getItem(lastKey) === tag;
+    if (!attempted) {
+      localStorage.setItem(key, String(transfer.time));
+      localStorage.setItem(lastKey, tag);
+    }
+  } catch {
+    unsavedTransfers.set(key, transfer.time);
+    toast("Storage is unavailable. Keep this page open to track the transfer.");
+  }
+  sessionStorage.removeItem("transferApproval");
+  if (attempted) { await checkTransfer(transfer, true); return; }
+  setPhase("working");
+  $("#instr").textContent = "Signed on Solder. Sending to the network…";
+  try {
+    const sig = await rpc("sendTransaction", [r.tx, { encoding: "base64", preflightCommitment: "confirmed" }], profile.endpoint);
+    if (trackedTransfer !== transfer) return;
+    if (sig !== r.signature) {
+      transferResult(transfer, "pending", "The RPC returned a different signature. Check the original transfer before sending again.");
+      return;
+    }
+  } catch (e) {
+    if (trackedTransfer !== transfer) return;
+    if (e.transactionError === "AlreadyProcessed" || /already (?:been )?processed/i.test(e.message)) {
+      await checkTransfer(transfer, true);
+      return;
+    }
+    const rejected = [-32002, -32003, -32602].includes(e.rpcCode);
+    transferResult(transfer, rejected ? "failed" : "pending",
+      rejected ? "Transfer rejected: " + e.message : "Submission is unconfirmed. " + e.message);
+    return;
+  }
+  await checkTransfer(transfer, false);
+}
+function retryTransfer() {
+  if (trackedTransfer && !$("#checkTransferBtn").hidden) checkTransfer(trackedTransfer, true);
+}
+$("#checkTransferBtn").onclick = retryTransfer;
+$("#forgetTransferBtn").onclick = () => {
+  if (!trackedTransfer || !confirm("Remove this transfer from this browser’s pending list? It can still confirm on the network.")) return;
+  forgetTransfer(trackedTransfer);
+  $("#doneBtn").click();
+};
+window.addEventListener("online", retryTransfer);
 
 function finish(r) {
   setPhase(r.state);
@@ -1207,9 +1377,8 @@ function finish(r) {
   $("#doneBtn").hidden = false;
   const instr = $("#instr"), res = $("#result");
   if (r.state === "done") {
-    instr.textContent = r.kind === "wipe" ? "The wallet was erased." : r.kind === "sign-message" ? "Message signed." : "Sent and confirmed.";
+    instr.textContent = r.kind === "wipe" ? "The wallet was erased." : "Message signed.";
     if (r.kind === "sign-message") { res.innerHTML = '<div class="sub" style="color:var(--silk-dim)">Signature (base58)</div><div class="mono"></div>'; res.querySelector(".mono").textContent = r.signature; }
-    else if (r.kind !== "wipe") { res.innerHTML = '<a target="_blank" rel="noopener">View on Solana Explorer</a>'; res.querySelector("a").href = "https://explorer.solana.com/tx/" + r.signature + cluster(); }
   } else if (r.state === "failed") {
     instr.textContent = r.error || "It did not go through.";
     if (r.signature) { res.innerHTML = '<a target="_blank" rel="noopener">See the transaction</a>'; res.querySelector("a").href = "https://explorer.solana.com/tx/" + r.signature + cluster(); }
@@ -1219,7 +1388,9 @@ function finish(r) {
 $("#rejectBtn").onclick = () => api("request/reject", { id: approvalId }).then((r) => paintRequest(r.request)).catch((e) => toast(e.message));
 $("#doneBtn").onclick = async () => {
   await refreshInfo().catch(() => {});
+  if (current !== "approve") return;
   if (!state.info.hasWallet) { lockedOut(); reset("welcome"); return; }
+  if (!state.info.unlocked || !state.token) { lockedOut(); return; }
   $("#sendTo").value = ""; $("#sendAmt").value = ""; $("#signMsg").value = "";
   reset("home");
 };
@@ -1297,13 +1468,30 @@ const views = {
   if (i.restorePending && state.setupToken && sessionStorage.getItem("restorePending")) { waitForRestore(state.setupToken); return; }
   if (sessionStorage.getItem("restorePending")) forgetSetup(true);
   if (i.unlocked && state.token && i.hasWallet && !i.defaultPassword) {
+    const token = state.token;
     try {
       const r = await api("request", undefined, { quiet: true });
-      reset("home");
-      if (r.request.state === "waiting") startApproval(r.request);
-      return;
+      if (state.token !== token) return;
+      const profile = transferProfile();
+      const approval = sessionStorage.getItem("transferApproval");
+      const expected = transferApprovalKey(r.request.id, profile);
+      if (r.request.state === "waiting") {
+        if (approval && approval.startsWith(token + "/" + r.request.id + "/") && approval !== expected) {
+          toast("Switch back to the original network to continue this transfer.");
+        } else {
+          startApproval(r.request);
+          return;
+        }
+      }
+      // A reload can land between the BOOT hold and the first broadcast.
+      // Only finish that handoff for this tab's still-unsubmitted approval.
+      if (r.request.state === "done" && r.request.tx && approval === expected) {
+        startApproval(r.request);
+        return;
+      }
     } catch (e) {
-      if (!/locked|Session/.test(e.message)) { reset("home"); return; }
+      if (state.token !== token) return;
+      if (e.status === 401) { lockedOut(); return; }
     }
   }
   route();
