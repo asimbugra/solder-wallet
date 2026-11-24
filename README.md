@@ -11,11 +11,11 @@ Built on [Infratic-lib](https://github.com/infraticxyz-lab/Infratic-lib), the So
 ## What it does
 
 - Runs only its own WiFi access point. No station mode, no internet, no RPC calls from the device
-- Factory WiFi password `admin123`; on first start the page asks for a new one, Solder restarts, and you join again with it
+- A unique setup password appears on the USB serial console and on the optional OLED. On first connection you choose your own WiFi password and reconnect
 - Creates a wallet on the device (12 or 24 backup words, same addresses as Phantom and Solflare) or restores one
 - Keeps the secret encrypted in flash with AES-256-GCM, key derived from your PIN; erases itself after 10 wrong PINs
 - Builds and signs SOL and SPL / Token-2022 transfers itself, signs messages
-- Every signature needs BOOT held for 1.5 s; a request expires after 45 s
+- Every signature needs a fresh 1.5 s BOOT hold. On OLED, tap through the review pages first. A request expires after 45 s without physical review activity
 - Optional OLED that shows what is being signed, independent of the phone
 
 ## How the pieces talk
@@ -50,9 +50,9 @@ The web page in `web/index.html` is packed into the firmware on every build (`we
 
 ## First start
 
-1. Join the WiFi `Solder-XXXX` with the password `admin123`. The page opens by itself, or go to `http://192.168.4.1`.
+1. Read the 16-character setup password from the OLED or USB serial monitor at 115200 baud. If the startup message has already passed, reset the board with the monitor open. Join `Solder-XXXX` with this password. The page opens by itself, or go to `http://192.168.4.1`.
 2. Choose a new WiFi password. Solder restarts; join again with the new password and the page continues.
-3. Create a wallet, write the words on paper, choose a 6-digit PIN.
+3. Create a wallet, write the words on paper, and choose a 6-digit PIN. When restoring a backup, check the words on the OLED if fitted and confirm the import with BOOT. Existing configured WiFi passwords and wallets carry over on upgrade.
 4. On devnet, tap "Get 1 test SOL", then Send. Hold BOOT when the page asks.
 
 ## Try it without a board
@@ -80,7 +80,7 @@ docs/SECURITY.md  what Solder protects against, and what it does not
 | --- | --- |
 | `GET /api/state` | wallet, network, password status |
 | `POST /api/ap-password` | set the WiFi password, then restart |
-| `POST /api/setup/generate`, `/api/setup/finish` | create or restore |
+| `POST /api/setup/generate`, `/api/setup/words`, `/api/setup/finish`, `/api/setup/cancel` | create or restore using a per-setup token |
 | `POST /api/unlock`, `/api/lock` | PIN session |
 | `POST /api/send`, `/api/sign`, `/api/wipe` | create a request for the button |
 | `GET /api/request`, `POST /api/request/reject` | follow or cancel it; a signed send returns the transaction |
@@ -88,7 +88,7 @@ docs/SECURITY.md  what Solder protects against, and what it does not
 
 ## Security
 
-Read [docs/SECURITY.md](docs/SECURITY.md) before you put real funds on it. In short: a plain ESP32 has no secure element, so turn on flash encryption for anything beyond testing, and use the OLED build so you can see what you sign.
+The default builds use a six-digit PIN and ordinary ESP32 flash. Physical flash protection requires explicit provisioning, including encrypted NVS. The OLED build lets you verify the full recipient, token mint and message on the device. Read the [security notes](docs/SECURITY.md) before funding a wallet.
 
 ## License
 

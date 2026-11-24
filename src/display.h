@@ -6,9 +6,11 @@
 namespace display
 {
     void begin();
+    bool available();
     void boot(const String &apName, const String &apPass);
     void idle(const String &address, bool locked);
-    void request(const Request &r);   // what is being signed + hold progress
+    unsigned reviewPages(const Request &r);
+    void request(const Request &r, unsigned page = 0);
     void words(const String &mnemonic, int page);
     void text(const String &line1, const String &line2 = "");
 }

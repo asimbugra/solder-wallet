@@ -4,7 +4,7 @@
 #include "config.h"
 
 // ---------------------------------------------------------------------------
-// Settings kept in NVS (not secret, the wallet itself lives in KeyStore)
+// WiFi credentials and network preferences kept in NVS
 // ---------------------------------------------------------------------------
 struct Settings
 {
@@ -13,10 +13,22 @@ struct Settings
     String customRpc;  // used by the browser, Solder itself never goes online
     uint8_t autoLockMin = SOLDER_DEFAULT_AUTOLOCK_MIN;
 
-    void load();
-    void save();
+    bool load();
+    bool setApPassword(const String &password);
+    bool setNetwork(const String &net, const String &rpc, uint8_t minutes);
+    static bool validCustomRpc(const String &rpc);
     String rpcUrl() const;
-    bool defaultPassword() const { return apPass == SOLDER_DEFAULT_AP_PASS; }
+    bool defaultPassword() const { return factory; }
+private:
+    bool factory = true;
+};
+
+// A storage error must never make an existing wallet available for setup.
+class WalletSlot : public KeyStore
+{
+public:
+    WalletSlot() : KeyStore("wallet") {}
+    bool exists();
 };
 
 // ---------------------------------------------------------------------------
@@ -54,22 +66,23 @@ const char *reqStateName(ReqState s);
 namespace solder
 {
     extern Settings settings;
-    extern KeyStore store;
+    extern WalletSlot store;
     extern Request request;
 
-    void begin();
+    bool begin();
     void loop();                       // button, LED, timeouts, auto lock, restart
 
     // session
     bool unlocked();
     String address();
-    bool unlock(const String &pin, String &outToken, String &outError);
+    bool unlock(const String &pin, String &outToken, String &outError, const String &pinClient = "");
     void lock();
-    bool checkSession(const String &token); // also counts as activity
+    bool checkSession(const String &token, bool touch = true);
 
     // setup
-    String pendingMnemonic();          // words generated but not saved yet
-    String generateMnemonic(uint8_t words);
+    const String &pendingMnemonic();
+    const String &generateMnemonic(uint8_t words);
+    void clearPendingMnemonic();
     bool finishSetup(const String &mnemonic, const String &pin, String &outError);
 
     // requests
@@ -78,6 +91,4 @@ namespace solder
 
     // restart after a short delay (so the HTTP answer still goes out)
     void restartSoon(uint32_t ms = 1500);
-
-    String shortAddress(const String &a);
 }

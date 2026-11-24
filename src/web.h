@@ -3,6 +3,6 @@
 
 namespace web
 {
-    void begin(const String &apName);
+    bool begin(const String &apName);
     void loop();
 }

@@ -499,7 +499,7 @@ textarea.input { min-height: 120px; resize: vertical; line-height: 1.6; }
     <!-- first start: replace the factory WiFi password -->
     <section class="view" id="v-appass">
       <h2>Lock the WiFi first</h2>
-      <p class="lede" id="apLede">Solder starts with the factory password. Anyone nearby could join with it, so pick your own. Solder restarts to use it.</p>
+      <p class="lede" id="apLede">Choose a new password to replace the device’s setup password. Solder restarts to use it.</p>
       <label class="field"><span>New WiFi password</span><input class="input" id="apPass1" type="password" autocomplete="new-password" minlength="8"></label>
       <label class="field"><span>Repeat it</span><input class="input" id="apPass2" type="password" autocomplete="new-password" minlength="8"></label>
       <p class="note">8 characters or more. You will type it once on your phone after the restart.</p>
@@ -534,25 +534,30 @@ textarea.input { min-height: 120px; resize: vertical; line-height: 1.6; }
 "use strict";
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
-const state = { token: sessionStorage.getItem("st") || "", info: null, tokens: [], history: [], pinMode: "unlock", pinFirst: "", mnemonic: "", wordCount: 12, setupWords: "", online: false };
+const state = { token: sessionStorage.getItem("st") || "", info: null, tokens: [], history: [], pinMode: "unlock", pinFirst: "", mnemonic: "", wordCount: 12, setupWords: "", setupToken: sessionStorage.getItem("setupToken") || "", online: false };
 const SOL_TOKEN = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const SOL_TOKEN22 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const pinClient = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, "0")).join("");
+let lastSessionAction = Date.now();
 
 // ---------- Solder API (the device) --------------------------------------
 async function api(path, body, opts = {}) {
   const ctrl = new AbortController();
+  const token = state.token;
   const t = setTimeout(() => ctrl.abort(), opts.timeout || 20000);
   try {
     const res = await fetch("/api/" + path, {
       method: body === undefined ? "GET" : "POST",
-      headers: { "Content-Type": "application/json", "X-Solder-Session": state.token },
+      headers: { "Content-Type": "application/json", "X-Solder-Session": token },
+      mode: "same-origin", redirect: "error", cache: "no-store", referrerPolicy: "no-referrer",
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: ctrl.signal,
     });
     const data = await res.json().catch(() => ({}));
-    if (res.status === 401 && state.info && state.info.hasWallet && !opts.quiet) lockedOut();
+    if (res.status === 401 && token === state.token && state.info && state.info.hasWallet && !opts.quiet) lockedOut();
     if (!res.ok) { const e = new Error(data.error || "Solder did not answer (" + res.status + ")"); e.status = res.status; throw e; }
+    if (token && token === state.token && body !== undefined) lastSessionAction = Date.now();
     return data;
   } catch (e) {
     if (e.name === "AbortError") throw new Error("Solder is busy, try again in a moment");
@@ -562,16 +567,19 @@ async function api(path, body, opts = {}) {
 }
 
 // ---------- Solana RPC (from the phone; Solder never goes online) ---------
-async function rpc(method, params = []) {
+async function rpc(method, params = [], endpoint = state.info.rpc) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 15000);
   try {
-    const res = await fetch(state.info.rpc, {
+    const res = await fetch(endpoint, {
       method: "POST", headers: { "Content-Type": "application/json" },
+      redirect: "error", credentials: "omit", referrerPolicy: "no-referrer",
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: ctrl.signal,
     });
+    if (!res.ok) throw new Error("RPC returned HTTP " + res.status);
     const data = await res.json();
     if (data.error) throw new Error(data.error.message || "RPC error");
+    if (data.jsonrpc !== "2.0" || data.id !== 1 || !Object.hasOwn(data, "result")) throw new Error("Invalid RPC response");
     setOnline(true);
     return data.result;
   } catch (e) {
@@ -598,6 +606,8 @@ function toast(text) {
 let current = "loading";
 function show(name, dir = "fwd", push = true) {
   if (name === current) return;
+  if (name === "welcome") forgetSetup();
+  if (current === "appass") $("#apPass1").value = $("#apPass2").value = "";
   const from = $("#v-" + current), to = $("#v-" + name);
   if (push && dir === "fwd") state.history.push(current);
   from.classList.remove("active", "in-fwd", "in-back");
@@ -612,7 +622,13 @@ function show(name, dir = "fwd", push = true) {
   const f = to.querySelector("input, textarea");
   if (f && matchMedia("(pointer:fine)").matches) setTimeout(() => f.focus(), 350);
 }
-function back() {
+async function back() {
+  if (current === "pin" && pinBusy) return;
+  if (restoreClaim) {
+    try { await api("setup/cancel", { setupToken: restoreClaim }); }
+    catch (e) { toast(e.message); return; }
+    forgetSetup(true); reset("restore"); return;
+  }
   const prev = state.history.pop();
   if (prev && prev !== "loading") show(prev, "back", false);
 }
@@ -623,7 +639,10 @@ document.addEventListener("click", (e) => {
   if (go) { e.preventDefault(); show(go.dataset.go); }
   if (e.target.closest("[data-back]")) back();
 });
-$("#settingsBtn").onclick = () => show("settings");
+$("#settingsBtn").onclick = () => {
+  if (current === "approve") { toast("Finish or cancel this request first"); return; }
+  show("settings");
+};
 
 // ---------- header -------------------------------------------------------
 function paintHeader() {
@@ -633,18 +652,44 @@ function paintHeader() {
   net.hidden = !i.hasWallet;
   net.textContent = i.network;
   net.className = "net" + (i.network === "mainnet" ? " main" : "");
-  $("#settingsBtn").hidden = !(i.hasWallet && i.unlocked);
+  $("#settingsBtn").hidden = !(i.hasWallet && i.unlocked && state.token);
 }
 
 async function refreshInfo() {
-  state.info = await api("state");
+  const token = state.token;
+  const info = await api("state");
+  if (state.token !== token) return state.info;
+  state.info = info;
   paintHeader();
   return state.info;
 }
 
+function forgetSetup(finished = false) {
+  state.pinFirst = state.mnemonic = state.setupWords = "";
+  if (finished) {
+    state.setupToken = restoreClaim = "";
+    sessionStorage.removeItem("setupToken");
+    sessionStorage.removeItem("restorePending");
+  }
+  $("#restoreWords").value = "";
+  $("#wordList").replaceChildren();
+  $("#checkFields").replaceChildren();
+}
+
 function lockedOut() {
+  clearTimeout(poll);
+  approvalId = null;
   state.token = "";
   sessionStorage.removeItem("st");
+  forgetSetup(true);
+  pin = "";
+  $("#apPass1").value = $("#apPass2").value = $("#rpcUrl").value = "";
+  $("#sendTo").value = $("#sendAmt").value = $("#signMsg").value = "";
+  for (const id of ["sumBox", "result", "fullAddr", "qr", "tokens", "activity", "addrShort", "balance"]) $("#" + id).replaceChildren();
+  delete $("#balance").dataset.v;
+  state.tokens = [];
+  if (state.info) { state.info.unlocked = false; state.info.address = state.info.rpc = ""; }
+  $("#settingsBtn").hidden = true;
   state.pinMode = "unlock";
   reset("pin");
 }
@@ -652,7 +697,8 @@ function lockedOut() {
 // where to go once Solder answers
 function route() {
   const i = state.info;
-  if (i.defaultPassword) { $("#apBack").hidden = true; $("#apLede").textContent = "Solder starts with the factory password. Anyone nearby could join with it, so pick your own. Solder restarts to use it."; reset("appass"); return; }
+  if (i.hasWallet && !(i.unlocked && state.token)) { lockedOut(); return; }
+  if (i.defaultPassword) { $("#apBack").hidden = true; $("#apLede").textContent = "Choose a new password to replace the device’s setup password. Solder restarts to use it."; reset("appass"); return; }
   if (!i.hasWallet) { reset("welcome"); return; }
   if (i.unlocked && state.token) { reset("home"); return; }
   lockedOut();
@@ -668,6 +714,7 @@ $("#apSave").onclick = async () => {
   btn.disabled = true;
   try {
     await api("ap-password", { password: a });
+    sessionStorage.removeItem("st"); state.token = "";
     $("#apPass1").value = ""; $("#apPass2").value = "";
     $("#rsName").textContent = state.info.apName;
     reset("restart");
@@ -683,7 +730,7 @@ async function waitForRestart() {
   for (;;) {
     try {
       const i = await api("state", undefined, { timeout: 3000 });
-      if (!i.defaultPassword) {
+      if (!i.defaultPassword && !i.restarting) {
         state.info = i; paintHeader();
         status.innerHTML = "Back online with the new password.";
         $(".restart-art").classList.add("done-art");
@@ -707,13 +754,25 @@ $$("#wordCount button").forEach((b) => b.onclick = () => {
 });
 
 async function makeWords() {
+  const generation = ++wordGeneration;
+  const count = state.wordCount;
+  state.setupWords = state.mnemonic = "";
   $("#wroteBtn").disabled = true;
+  $("#revealBtn").disabled = true;
   $("#revealBtn").hidden = false;
   const list = $("#wordList");
   list.innerHTML = "";
   list.classList.add("hidden");
   try {
-    const r = await api("setup/generate", { words: state.wordCount });
+    const generate = generationQueue.then(async () => {
+      const r = await api("setup/generate", { words: count, setupToken: state.setupToken });
+      state.setupToken = r.setupToken;
+      sessionStorage.setItem("setupToken", r.setupToken);
+      return r;
+    });
+    generationQueue = generate.catch(() => {});
+    const r = await generate;
+    if (generation !== wordGeneration || current !== "create") return;
     if (r.onScreen) {
       list.hidden = true;
       $("#revealBtn").hidden = true;
@@ -726,8 +785,10 @@ async function makeWords() {
         b.className = p === 0 ? "on" : "";
         b.onclick = async () => {
           $$("#wordPages button").forEach((x) => x.classList.toggle("on", x === b));
-          await api("setup/words", { page: p });
-          if (p === r.count / 6 - 1) $("#wroteBtn").disabled = false;
+          try {
+            await api("setup/words", { page: p, setupToken: r.setupToken });
+            if (p === r.count / 6 - 1) $("#wroteBtn").disabled = false;
+          } catch (e) { toast(e.message); }
         };
         pages.appendChild(b);
       }
@@ -741,6 +802,7 @@ async function makeWords() {
       li.style.animationDelay = (i * 35) + "ms";
       list.appendChild(li);
     });
+    $("#revealBtn").disabled = false;
   } catch (e) { toast(e.message); }
 }
 
@@ -754,6 +816,7 @@ $("#revealBtn").onclick = () => {
   }
 };
 
+let wordGeneration = 0, generationQueue = Promise.resolve();
 $("#wroteBtn").onclick = () => {
   if (!state.setupWords) { state.mnemonic = ""; startPin("set"); return; }
   const words = state.setupWords.split(" ");
@@ -779,10 +842,15 @@ $("#checkBtn").onclick = () => {
   startPin("set");
 };
 
-$("#restoreBtn").onclick = () => {
+$("#restoreBtn").onclick = async () => {
   const w = $("#restoreWords").value.trim().toLowerCase().split(/\s+/).filter(Boolean);
   if (w.length !== 12 && w.length !== 24) { $("#restoreErr").textContent = "Enter 12 or 24 words. You entered " + w.length + "."; return; }
   $("#restoreErr").textContent = "";
+  if (state.setupToken) {
+    try { await api("setup/cancel", { setupToken: state.setupToken }); }
+    catch (e) { $("#restoreErr").textContent = e.message; return; }
+    state.setupToken = ""; sessionStorage.removeItem("setupToken");
+  }
   state.mnemonic = w.join(" ");
   startPin("set");
 };
@@ -820,7 +888,7 @@ document.addEventListener("keydown", (e) => {
 });
 let pinBusy = false;
 async function pinKey(k) {
-  if (pinBusy) return;
+  if (pinBusy || restoreClaim) return;
   if (k === "⌫") { pin = pin.slice(0, -1); paintPin(); return; }
   if (pin.length >= PIN_LEN) return;
   pin += k;
@@ -831,17 +899,18 @@ async function pinKey(k) {
   try {
     if (state.pinMode === "unlock") {
       $("#pinLede").innerHTML = '<span class="spin"></span> Unlocking';
-      const r = await api("unlock", { pin: entered }, { quiet: true });
-      onSession(r.token);
+      const r = await api("unlock", { pin: entered, pinClient }, { quiet: true });
+      await onSession(r.token);
     } else if (state.pinMode === "set") {
       state.pinFirst = entered; pin = ""; state.pinMode = "confirm"; views.pin();
     } else if (state.pinMode === "confirm") {
       if (entered !== state.pinFirst) { pin = ""; state.pinMode = "set"; views.pin(); $("#pinErr").textContent = "The PINs did not match, start again."; paintPin(true); }
       else {
         $("#pinLede").innerHTML = '<span class="spin"></span> Encrypting the keys on Solder';
-        const r = await api("setup/finish", { pin: entered, mnemonic: state.mnemonic });
-        state.mnemonic = ""; state.setupWords = ""; $("#restoreWords").value = ""; $("#wordList").innerHTML = "";
-        onSession(r.token);
+        const r = await api("setup/finish", { pin: entered, mnemonic: state.mnemonic, setupToken: state.setupToken });
+        if (r.pending) { waitForRestore(r.setupToken); return; }
+        forgetSetup(true);
+        await onSession(r.token);
         toast("Wallet ready");
       }
     }
@@ -852,14 +921,45 @@ async function pinKey(k) {
     if (state.pinMode === "unlock") $("#pinLede").textContent = "Enter your PIN.";
     if (state.pinMode === "confirm") { state.pinMode = "set"; views.pin(); $("#pinErr").textContent = e.message; }
     await refreshInfo().catch(() => {});
-    if (!state.info.hasWallet) setTimeout(() => reset("welcome"), 2500);
+    if (!state.info.hasWallet && state.pinMode === "unlock") setTimeout(() => reset("welcome"), 2500);
   } finally { pinBusy = false; }
 }
-function onSession(token) {
+async function onSession(token) {
   state.token = token;
+  lastSessionAction = Date.now();
   sessionStorage.setItem("st", token);
   pin = "";
-  refreshInfo().then(() => reset("home"));
+  await refreshInfo();
+  route();
+}
+
+let restoreClaim = "";
+async function waitForRestore(claim) {
+  restoreClaim = state.setupToken = claim;
+  sessionStorage.setItem("setupToken", claim);
+  sessionStorage.setItem("restorePending", "1");
+  forgetSetup();
+  pin = ""; state.pinMode = "restore";
+  if (current === "pin") views.pin(); else reset("pin");
+  while (restoreClaim === claim) {
+    await sleep(750);
+    if (restoreClaim !== claim) return;
+    try {
+      const r = await api("setup/finish", { setupToken: claim }, { timeout: 10000 });
+      if (restoreClaim !== claim) return;
+      if (r.pending) continue;
+      forgetSetup(true);
+      await onSession(r.token);
+      toast("Wallet ready");
+    } catch (e) {
+      if (restoreClaim !== claim) return;
+      if (!e.status || e.status === 503) continue;
+      forgetSetup(true);
+      await refreshInfo().catch(() => {});
+      if (state.info.hasWallet) route(); else reset("restore");
+      $("#restoreErr").textContent = e.message;
+    }
+  }
 }
 
 // ---------- home ---------------------------------------------------------
@@ -868,7 +968,7 @@ function fmtSol(lamports) {
   return s === "" ? "0" : s;
 }
 function shortAddr(a) { return a ? a.slice(0, 4) + "…" + a.slice(-4) : ""; }
-function cluster() { return state.info.network === "mainnet" ? "" : state.info.network === "devnet" ? "?cluster=devnet" : "?cluster=custom&customUrl=" + encodeURIComponent(state.info.rpc); }
+function cluster() { return state.info.network === "mainnet" ? "" : state.info.network === "devnet" ? "?cluster=devnet" : "?cluster=custom"; }
 function ago(t) {
   if (!t) return "pending";
   const s = Date.now() / 1000 - t;
@@ -880,9 +980,11 @@ function ago(t) {
 
 function countUp(el, value) {
   const target = value / 1e9, start = performance.now(), dur = 700;
+  const token = state.token;
   const from = parseFloat(el.dataset.v || "0");
   el.dataset.v = target;
   const step = (now) => {
+    if (token !== state.token) return;
     const k = Math.min(1, (now - start) / dur), e = 1 - Math.pow(1 - k, 3);
     el.innerHTML = fmtSol((from + (target - from) * e) * 1e9) + "<small>SOL</small>";
     if (k < 1) requestAnimationFrame(step);
@@ -890,10 +992,10 @@ function countUp(el, value) {
   requestAnimationFrame(step);
 }
 
-async function loadTokens(owner) {
+async function loadTokens(owner, endpoint) {
   const out = [];
   for (const programId of [SOL_TOKEN, SOL_TOKEN22]) {
-    const r = await rpc("getTokenAccountsByOwner", [owner, { programId }, { encoding: "jsonParsed" }]);
+    const r = await rpc("getTokenAccountsByOwner", [owner, { programId }, { encoding: "jsonParsed" }], endpoint);
     for (const a of r.value) {
       const i = a.account.data.parsed.info;
       if (i.tokenAmount.amount === "0") continue;
@@ -904,14 +1006,19 @@ async function loadTokens(owner) {
 }
 
 async function loadHome() {
-  const i = state.info;
+  const i = state.info, token = state.token;
+  const stillCurrent = () => token && token === state.token && i.rpc === state.info.rpc;
+  if (!stillCurrent()) return;
   $("#addrShort").textContent = shortAddr(i.address);
   $("#faucetBtn").hidden = i.network !== "devnet";
   $("#homeErr").textContent = "";
   try {
-    const bal = await rpc("getBalance", [i.address, { commitment: "confirmed" }]);
+    const bal = await rpc("getBalance", [i.address, { commitment: "confirmed" }], i.rpc);
+    if (!stillCurrent()) return;
     countUp($("#balance"), bal.value);
-    state.tokens = await loadTokens(i.address);
+    const tokens = await loadTokens(i.address, i.rpc);
+    if (!stillCurrent()) return;
+    state.tokens = tokens;
     $("#tokens").innerHTML = state.tokens.length ? "" : '<li class="empty">No tokens yet</li>';
     state.tokens.forEach((t) => {
       const li = document.createElement("li");
@@ -920,7 +1027,8 @@ async function loadHome() {
       li.querySelector(".end").textContent = t.amount;
       $("#tokens").appendChild(li);
     });
-    const sigs = await rpc("getSignaturesForAddress", [i.address, { limit: 10 }]);
+    const sigs = await rpc("getSignaturesForAddress", [i.address, { limit: 10 }], i.rpc);
+    if (!stillCurrent()) return;
     const list = $("#activity");
     list.innerHTML = sigs.length ? "" : '<li class="empty">Nothing here yet. Receive some SOL to start.</li>';
     sigs.forEach((it) => {
@@ -928,11 +1036,12 @@ async function loadHome() {
       li.innerHTML = `<span class="via${it.err ? " bad" : ""}"></span><div><a class="main" target="_blank" rel="noopener"></a><div class="sub"></div></div>`;
       const link = li.querySelector("a");
       link.textContent = shortAddr(it.signature);
-      link.href = "https://explorer.solana.com/tx/" + it.signature + cluster();
+      link.href = "https://explorer.solana.com/tx/" + encodeURIComponent(it.signature) + cluster();
       li.querySelector(".sub").textContent = (it.err ? "Failed · " : "") + ago(it.blockTime);
       list.appendChild(li);
     });
   } catch (e) {
+    if (!stillCurrent()) return;
     $("#homeErr").textContent = e.message;
     if (!$("#balance").dataset.v) $("#balance").innerHTML = "–<small>SOL</small>";
     $("#tokens").innerHTML = '<li class="empty">Needs internet on your phone</li>';
@@ -947,7 +1056,11 @@ function copy(text, el) {
   if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done);
   else { const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); done(); }
 }
-$("#lockBtn").onclick = async () => { await api("lock", {}).catch(() => {}); lockedOut(); };
+$("#lockBtn").onclick = async () => {
+  try { await api("lock", {}); }
+  catch (e) { if (e.status !== 401) toast("Could not confirm the device lock. Check Solder."); }
+  lockedOut();
+};
 $("#faucetBtn").onclick = async () => {
   const b = $("#faucetBtn");
   b.disabled = true; b.innerHTML = '<span class="spin"></span> Asking the faucet';
@@ -969,9 +1082,12 @@ $("#sendBtn").onclick = async () => {
   try {
     const mint = $("#sendToken").value;
     const t = state.tokens.find((x) => x.mint === mint);
-    const bh = await rpc("getLatestBlockhash", [{ commitment: "confirmed" }]);
-    const r = await api("send", { to: $("#sendTo").value.trim(), amount: $("#sendAmt").value.trim(), mint, decimals: t ? t.decimals : 9, program: t ? t.program : undefined, blockhash: bh.value.blockhash });
-    startApproval(r.request);
+    const endpoint = state.info.rpc, session = state.token;
+    const to = $("#sendTo").value.trim(), amount = $("#sendAmt").value.trim();
+    const bh = await rpc("getLatestBlockhash", [{ commitment: "confirmed" }], endpoint);
+    if (current !== "send" || state.token !== session || endpoint !== state.info.rpc) return;
+    const r = await api("send", { to, amount, mint, decimals: t ? t.decimals : 9, program: t ? t.program : undefined, blockhash: bh.value.blockhash });
+    startApproval(r.request, endpoint);
   } catch (e) { $("#sendErr").textContent = e.message; }
   finally { b.disabled = false; }
 };
@@ -982,8 +1098,11 @@ $("#signBtn").onclick = async () => {
 };
 
 // ---------- approval -----------------------------------------------------
-let poll = null, traceLen = 0;
-function startApproval(req) {
+let poll = null, traceLen = 0, approvalId = null, approvalEndpoint = "";
+function startApproval(req, endpoint = state.info.rpc) {
+  clearTimeout(poll);
+  approvalId = req.id;
+  approvalEndpoint = endpoint;
   const view = $("#v-approve");
   ["waiting", "working", "done", "failed", "rejected", "expired"].forEach((c) => view.classList.remove(c));
   $("#result").textContent = "";
@@ -999,19 +1118,39 @@ function startApproval(req) {
     box.innerHTML = `<div class="what"></div><div class="to"></div>`;
     box.querySelector(".what").textContent = "Send " + req.amount + " " + req.symbol;
     box.querySelector(".to").textContent = "to " + req.to;
+    if (req.kind === "send-token") {
+      const mint = document.createElement("div");
+      mint.className = "to";
+      mint.textContent = "Mint " + req.mint;
+      box.appendChild(mint);
+    }
   } else if (req.kind === "sign-message") {
     box.innerHTML = `<div class="what">Sign message</div><div class="msg"></div>`;
-    box.querySelector(".msg").textContent = req.message;
+    box.querySelector(".msg").textContent = Array.from(new TextEncoder().encode(req.message), b =>
+      b >= 0x20 && b <= 0x7e && b !== 0x5c ? String.fromCharCode(b) : "\\x" + b.toString(16).padStart(2, "0")
+    ).join("");
   } else if (req.kind === "wipe") {
     box.innerHTML = `<div class="what" style="color:var(--led)">Erase the wallet</div><div class="to">The keys are deleted from Solder. Only your backup words can bring it back.</div>`;
   }
   $("#stamp").textContent = req.kind === "wipe" ? "Erased" : "Signed";
   show("approve");
   paintRequest(req);
-  clearInterval(poll);
-  poll = setInterval(async () => {
-    try { const r = await api("request", undefined, { timeout: 5000 }); paintRequest(r.request); } catch (e) { /* keep polling */ }
-  }, 160);
+  const check = async () => {
+    if (approvalId !== req.id) return;
+    try {
+      const r = await api("request?id=" + req.id, undefined, { timeout: 5000 });
+      if (approvalId !== req.id) return;
+      if (r.request.id !== req.id) paintRequest({ id: req.id, state: "failed", error: "The approval request has changed." });
+      else paintRequest(r.request);
+    } catch (e) {
+      if (approvalId !== req.id) return;
+      if (e.status === 404 || e.status === 409) {
+        paintRequest({ id: req.id, state: "failed", error: "This request is no longer on the device." });
+      }
+    }
+    if (approvalId === req.id) poll = setTimeout(check, 160);
+  };
+  if (approvalId === req.id) poll = setTimeout(check, 160);
 }
 
 function setPhase(name) {
@@ -1019,9 +1158,8 @@ function setPhase(name) {
   ["waiting", "working", "done", "failed", "rejected", "expired"].forEach((c) => view.classList.toggle(c, c === name));
 }
 
-let lastPainted = 0;
 function paintRequest(r) {
-  if (r.state !== "waiting" && r.id === lastPainted) return; // already handled
+  if (r.id !== approvalId) return;
   const hold = r.state === "waiting" ? r.hold : r.state === "done" ? 1 : 0;
   $("#fillPath").style.strokeDashoffset = traceLen * (1 - hold);
   $("#aBtn").classList.toggle("pressed", r.state === "waiting" && r.hold > 0);
@@ -1029,26 +1167,28 @@ function paintRequest(r) {
   timer.textContent = "";
   if (r.state === "waiting") {
     setPhase("waiting");
-    instr.innerHTML = r.hold > 0 ? "Keep holding <b>BOOT</b>…" : `Check the details${state.info.screen ? " on Solder's screen" : ""}, then hold <b>BOOT</b> for ${(state.info.holdMs / 1000).toFixed(1)} s.`;
+    const review = state.info.screen ? "Follow Solder’s screen. Tap <b>BOOT</b> for each next page, then hold" : "Check the details, then hold";
+    instr.innerHTML = r.hold > 0 ? "Keep holding <b>BOOT</b>…" : `${review} <b>BOOT</b> for ${(state.info.holdMs / 1000).toFixed(1)} s.`;
     timer.textContent = "Expires in " + r.expiresIn + " s";
     return;
   }
-  clearInterval(poll);
-  lastPainted = r.id;
+  clearTimeout(poll);
+  approvalId = null;
   $("#rejectBtn").hidden = true;
-  if (r.state === "done" && r.tx) { broadcast(r); return; }
+  if (r.state === "done" && r.tx) { broadcast(r, approvalEndpoint); return; }
   finish(r);
 }
 
-async function broadcast(r) {
+async function broadcast(r, endpoint) {
   setPhase("working");
   const instr = $("#instr");
   instr.innerHTML = '<span class="spin"></span> Signed on Solder. Sending to the network';
   try {
-    const sig = await rpc("sendTransaction", [r.tx, { encoding: "base64", preflightCommitment: "confirmed" }]);
+    const sig = await rpc("sendTransaction", [r.tx, { encoding: "base64", preflightCommitment: "confirmed" }], endpoint);
+    if (sig !== r.signature) throw new Error("The RPC returned a different transaction signature. Check the signed transaction in Explorer.");
     instr.innerHTML = '<span class="spin"></span> Waiting for confirmation';
     for (let i = 0; i < 40; i++) {
-      const st = await rpc("getSignatureStatuses", [[sig]]);
+      const st = await rpc("getSignatureStatuses", [[r.signature]], endpoint);
       const s = st.value[0];
       if (s && s.err) throw new Error("The network rejected the transaction");
       if (s && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")) { finish(r); return; }
@@ -1076,10 +1216,10 @@ function finish(r) {
   } else if (r.state === "rejected") instr.textContent = "Cancelled. Nothing was signed.";
   else if (r.state === "expired") instr.textContent = "The button was not held in time. Nothing was signed.";
 }
-$("#rejectBtn").onclick = () => api("request/reject", {}).then((r) => paintRequest(r.request)).catch((e) => toast(e.message));
+$("#rejectBtn").onclick = () => api("request/reject", { id: approvalId }).then((r) => paintRequest(r.request)).catch((e) => toast(e.message));
 $("#doneBtn").onclick = async () => {
   await refreshInfo().catch(() => {});
-  if (!state.info.hasWallet) { state.token = ""; reset("welcome"); return; }
+  if (!state.info.hasWallet) { lockedOut(); reset("welcome"); return; }
   $("#sendTo").value = ""; $("#sendAmt").value = ""; $("#signMsg").value = "";
   reset("home");
 };
@@ -1128,6 +1268,15 @@ const views = {
   pin: () => {
     pin = ""; paintPin(); $("#pinErr").textContent = "";
     const m = state.pinMode;
+    $("#keypad").hidden = $("#pinDots").hidden = m === "restore";
+    if (m === "restore") {
+      $("#pinBack").hidden = false;
+      $("#pinTitle").textContent = "Restore wallet";
+      $("#pinLede").textContent = state.info.screen
+        ? "Check every word on Solder. Tap BOOT for the next page, then hold BOOT to restore."
+        : "Hold BOOT to restore this backup.";
+      return;
+    }
     $("#pinBack").hidden = m === "unlock";
     $("#pinTitle").textContent = m === "unlock" ? "Unlock" : m === "set" ? "Choose a PIN" : "Repeat the PIN";
     $("#pinLede").textContent = m === "unlock" ? "Enter your PIN." : m === "set" ? "6 digits. It encrypts the keys on Solder. After 10 wrong tries Solder erases itself." : "Once more, to be sure.";
@@ -1145,6 +1294,8 @@ const views = {
     catch (e) { $("#v-loading").innerHTML = '<div style="margin:auto;text-align:center"><span class="spin"></span><p class="note"></p></div>'; $("#v-loading .note").textContent = e.message; await sleep(2000); }
   }
   const i = state.info;
+  if (i.restorePending && state.setupToken && sessionStorage.getItem("restorePending")) { waitForRestore(state.setupToken); return; }
+  if (sessionStorage.getItem("restorePending")) forgetSetup(true);
   if (i.unlocked && state.token && i.hasWallet && !i.defaultPassword) {
     try {
       const r = await api("request", undefined, { quiet: true });
@@ -1157,7 +1308,18 @@ const views = {
   }
   route();
 })();
-setInterval(() => { if (state.info && !["approve", "restart", "appass"].includes(current)) refreshInfo().catch(() => {}); }, 15000);
+async function checkVisibleSession() {
+  if (!state.info || !state.token || current === "restart") return;
+  try {
+    const info = await refreshInfo();
+    if (state.token && !info.unlocked && (info.hasWallet || current !== "approve")) { lockedOut(); route(); }
+  } catch (e) {
+    const min = state.info.autoLockMin;
+    if (state.token && min && Date.now() - lastSessionAction >= min * 60000) lockedOut();
+  }
+}
+setInterval(checkVisibleSession, 15000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) checkVisibleSession(); });
 </script>
 </body>
 </html>

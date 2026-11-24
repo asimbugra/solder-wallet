@@ -13,9 +13,11 @@ import argparse
 import base64
 import json
 import random
+import re
 import secrets
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -23,12 +25,14 @@ ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
 HOLD_MS = 1500
 TIMEOUT_S = 45
-FACTORY_PASS = "admin123"
+FACTORY_PASS = "".join(secrets.choice("23456789ABCDEFGHJKLMNPQRSTUVWXYZ") for _ in range(16))
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 WORDS = ("orbit velvet canyon harbor lantern meadow pilot ribbon silver tunnel wagon anchor "
          "breeze cactus dragon ember falcon glacier hollow island jungle kettle marble nectar").split()
 ADDRESS = "SoLdR7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJ"
 USDC = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+ASSETS = {"/vendor/" + f.name: f for f in (WEB / "vendor").iterdir()
+          if f.is_file() and not f.is_symlink() and f.suffix in (".woff2", ".js")}
 
 
 def b58(n):
@@ -40,8 +44,9 @@ class Chain:
 
     def __init__(self):
         self.lamports = 0
-        self.history = []          # (signature, time, err)
+        self.history = deque(maxlen=100)     # (signature, time, err)
         self.pending = {}          # signature -> confirm time
+        self.signed = None         # most recent unbroadcast simulated transaction
 
     def call(self, method, params):
         now = time.time()
@@ -55,6 +60,8 @@ class Chain:
         if method == "getSignaturesForAddress":
             return [{"signature": s, "blockTime": int(t), "err": e} for s, t, e in reversed(self.history)][:10]
         if method == "requestAirdrop":
+            if type(params[1]) is not int or not 0 < params[1] <= 2_000_000_000:
+                raise ValueError("Invalid airdrop amount")
             sig = b58(87)
             self.lamports += int(params[1])
             self.history.append((sig, now, None))
@@ -62,12 +69,19 @@ class Chain:
         if method == "getLatestBlockhash":
             return {"context": {"slot": 1}, "value": {"blockhash": b58(44), "lastValidBlockHeight": 1000}}
         if method == "sendTransaction":
-            meta = json.loads(base64.b64decode(params[0]).decode())
-            self.pending[meta["signature"]] = now + 1.4
-            if meta.get("lamports"):
-                self.lamports -= meta["lamports"] + 5000
-            self.history.append((meta["signature"], now, None))
-            return meta["signature"]
+            if self.signed is None or params[0] != self.signed[0]:
+                raise ValueError("No matching signed transaction")
+            _, sig, lamports = self.signed
+            if sig in self.pending:
+                return sig
+            if self.lamports < lamports + 5000:
+                raise ValueError("Insufficient balance")
+            self.lamports -= lamports + 5000
+            if len(self.pending) >= 100:
+                del self.pending[next(iter(self.pending))]
+            self.pending[sig] = now + 1.4
+            self.history.append((sig, now, None))
+            return sig
         if method == "getSignatureStatuses":
             out = []
             for s in params[0]:
@@ -85,13 +99,24 @@ class Device:
         self.unlocked = False
         self.token = ""
         self.network = "devnet"
+        self.auto_lock_min = 5
+        self.last_activity = 0
         self.req = None
+        self.next_id = 1
         self.press_start = None
         self.pressed = False
+        self.wait_release = False
         self.pending_words = ""
+        self.setup_token = ""
+        self.setup_time = 0
         self.fails = 0
+        self.pin_delay = 0
+        self.pin_gate = False
+        self.pin_client = ""
+        self.pin_candidate = ""
+        self.pin_allowed_until = 0
         self.down_until = 0       # simulated restart
-        self.screen = ["Solder", "WiFi: Solder-3F2A", "Pass: " + self.ap_pass, "Open 192.168.4.1"]
+        self.screen = ["Solder", "WiFi: Solder-3F2A", "Pass: " + ("(your password)" if ready else FACTORY_PASS), "Open 192.168.4.1"]
         self.led = False
         self.lock = threading.Lock()
         self.chain = Chain()
@@ -103,19 +128,76 @@ class Device:
         r = self.req
         if r and r["state"] == "waiting":
             if r["kind"] in ("send", "send-token"):
-                self.screen = ["Send", r["amount"] + " " + r["symbol"], "to " + r["to"][:5] + ".." + r["to"][-5:], "Hold BOOT to approve"]
+                lines = [r["amount"] + " " + r["symbol"], "To " + r["to"]]
+                if r.get("mint"):
+                    lines.append("Mint " + r["mint"])
             elif r["kind"] == "sign-message":
-                self.screen = ["Sign message", r["message"][:21], r["message"][21:42], "Hold BOOT to approve"]
+                lines = ["".join(chr(b) if 32 <= b < 127 and b != 92 else f"\\x{b:02x}"
+                                 for b in r["message"].encode())]
+            elif r["kind"] == "restore":
+                lines = [f"{i}. {word}" for i, word in enumerate(r["_words"].split(), 1)]
             else:
-                self.screen = ["ERASE WALLET", "Keys are deleted.", "Only the words restore.", "Hold BOOT to approve"]
+                lines = ["Keys are deleted.", "Restore with words."]
+            rows = [line[i:i + 21] for line in lines for i in range(0, len(line), 21)]
+            r["_pages"] = (len(rows) + 1) // 2
+            pos = r["_page"] * 2
+            title = {"send": "Send", "send-token": "Send token", "sign-message": "Sign message",
+                     "wipe": "ERASE WALLET", "restore": "Restore wallet"}[r["kind"]]
+            self.screen = [title, rows[pos], rows[pos + 1] if pos + 1 < len(rows) else "",
+                           "Hold BOOT to approve" if r["_page"] + 1 == r["_pages"] else "Tap BOOT for next"]
+        elif self.pin_gate:
+            self.screen = ["PIN retry", "Hold and release BOOT", "then retry your PIN", ""]
         elif self.unlocked:
             self.screen = ["Solder - unlocked", ADDRESS[:5] + ".." + ADDRESS[-5:], "WiFi password set", "http://192.168.4.1"]
         elif self.has_wallet:
             self.screen = ["Solder - locked", "-", "WiFi password set", "http://192.168.4.1"]
+        else:
+            self.screen = ["Solder", "WiFi: Solder-3F2A", "WiFi password set", "Open 192.168.4.1"]
+
+    def end_session(self):
+        self.unlocked, self.token = False, ""
+        self.req = None
+        self.press_start = None
+        self.wait_release = self.pressed
+        self.clear_pin_gate()
+        self.paint()
+
+    def clear_pin_gate(self):
+        self.pin_gate = False
+        self.pin_allowed_until = 0
+        self.pin_client = self.pin_candidate = ""
 
     def tick(self):
-        r = self.req
         now = time.time()
+        if self.pin_client and now >= self.pin_allowed_until:
+            self.clear_pin_gate()
+            self.press_start = None
+            self.paint()
+        if self.unlocked and self.auto_lock_min and now - self.last_activity >= self.auto_lock_min * 60:
+            self.end_session()
+        if self.setup_token and now - self.setup_time >= 900:
+            self.setup_token = self.pending_words = ""
+            if self.req and self.req["kind"] == "restore":
+                self.req = None
+                self.paint()
+        if self.req and self.req["kind"] == "restore" and self.req["state"] == "done" and now >= self.req["_collect_until"]:
+            self.req = None
+            self.setup_token = ""
+            self.paint()
+        if self.wait_release:
+            if not self.pressed:
+                self.wait_release = False
+            self.press_start = None
+        r = self.req
+        if self.pin_gate:
+            if self.pressed and not self.wait_release and self.press_start is None:
+                self.press_start = now
+            if not self.pressed and self.press_start is not None:
+                if now - self.press_start >= HOLD_MS / 1000:
+                    self.pin_allowed_until = now + 30
+                    self.pin_gate = False
+                    self.paint()
+                self.press_start = None
         self.led = False
         if not r or r["state"] != "waiting":
             return
@@ -125,15 +207,20 @@ class Device:
             r["state"] = "expired"
             self.paint()
             return
-        if self.pressed:
+        if self.pressed and not self.wait_release:
             if self.press_start is None:
                 self.press_start = now
             h = (now - self.press_start) * 1000 / HOLD_MS
-            r["hold"] = min(1.0, h)
-            if h >= 1:
+            last = r["_page"] + 1 == r["_pages"]
+            r["hold"] = min(1.0, h) if last else 0
+            if last and h >= 1:
                 self.press_start = None
                 self.execute()
         else:
+            if self.press_start is not None and r["_page"] + 1 < r["_pages"] and now - self.press_start < HOLD_MS / 1000:
+                r["_page"] += 1
+                r["_t"] = now
+                self.paint()
             self.press_start = None
             r["hold"] = 0
         self.led = int(now / (0.08 if self.pressed else 0.4)) % 2 == 1
@@ -142,24 +229,29 @@ class Device:
         r = self.req
         if r["kind"] == "wipe":
             self.has_wallet = False
-            self.unlocked = False
-            self.token = ""
+            self.pin = ""
+            self.end_session()
+            self.req = r
+        elif r["kind"] == "restore":
+            r["_collect_until"] = time.time() + 30
         elif r["kind"] == "sign-message":
             r["signature"] = b58(88)
         else:
             sig = b58(88)
             r["signature"] = sig
-            lamports = int(round(float(r["amount"]) * 1e9)) if r["symbol"] == "SOL" else 0
+            lamports = r["_amount"] if r["kind"] == "send" else 0
             # a stand-in for the signed transaction: the fake chain reads it back
             r["tx"] = base64.b64encode(json.dumps({"signature": sig, "lamports": lamports}).encode()).decode()
+            self.chain.signed = (r["tx"], sig, lamports)
         r["state"] = "done"
         self.paint()
 
-    def state(self, host):
+    def state(self, owner):
         return {
             "version": "0.2.0-sim", "apName": "Solder-3F2A", "defaultPassword": self.ap_pass == FACTORY_PASS,
-            "hasWallet": self.has_wallet, "unlocked": self.unlocked, "address": ADDRESS if self.unlocked else "",
-            "network": self.network, "rpc": "http://%s/rpc" % host, "autoLockMin": 5, "screen": True,
+            "hasWallet": self.has_wallet, "unlocked": owner, "address": ADDRESS if owner else "",
+            "network": self.network, "rpc": "/rpc" if owner else "", "autoLockMin": self.auto_lock_min if owner else None, "screen": True,
+            "restorePending": bool(self.req and self.req["kind"] == "restore" and self.req["state"] in ("waiting", "done")),
             "holdMs": HOLD_MS, "timeoutS": TIMEOUT_S,
         }
 
@@ -202,6 +294,24 @@ if(s.hold!==null)oled.querySelector(".bar i").style.width=(s.hold*100)+"%";led.c
 class Handler(BaseHTTPRequestHandler):
     dev = None
     protocol_version = "HTTP/1.1"
+    timeout = 5
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        port = self.server.server_port
+        names = {f"localhost:{port}", f"127.0.0.1:{port}"}
+        if port == 80:
+            names.update(("localhost", "127.0.0.1"))
+        host = self.headers.get("Host", "").lower()
+        origin = self.headers.get("Origin")
+        if (self.headers.get_all("Host") != [self.headers.get("Host")] or host not in names
+                or (origin is not None and origin != "http://" + host)
+                or self.headers.get("Sec-Fetch-Site") == "cross-site"):
+            self.close_connection = True
+            self.send_json(403, {"error": "Open the simulator on localhost"})
+            return False
+        return True
 
     def log_message(self, *a):
         pass
@@ -211,7 +321,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; "
+                         "font-src 'self'; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'none'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -219,15 +334,36 @@ class Handler(BaseHTTPRequestHandler):
         self.send_body(code, json.dumps(obj).encode(), "application/json")
 
     def body(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        self.close_connection = True
+        if self.headers.get_content_type() != "application/json":
+            self.send_json(415, {"error": "Send JSON"})
+            return None
+        lengths = self.headers.get_all("Content-Length", [])
+        if "Transfer-Encoding" in self.headers or len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,5}", lengths[0]):
+            self.send_json(400, {"error": "Invalid request length"})
+            return None
+        n = int(lengths[0])
+        if n > 16384:
+            self.send_json(413, {"error": "Request too large"})
+            return None
         try:
-            return json.loads(self.rfile.read(n) or b"{}")
-        except json.JSONDecodeError:
-            return {}
+            b = json.loads(self.rfile.read(n).decode("utf-8"))
+            if not isinstance(b, dict):
+                raise ValueError()
+            return b
+        except (ValueError, RecursionError):
+            self.send_json(400, {"error": "Invalid JSON object"})
+            return None
+
+    def owns_session(self):
+        token = self.headers.get("X-Solder-Session", "")
+        return self.dev.unlocked and token.isascii() and secrets.compare_digest(token, self.dev.token)
 
     def session(self):
         d = self.dev
-        if d.unlocked and self.headers.get("X-Solder-Session") == d.token:
+        if self.owns_session():
+            if self.command == "POST":
+                d.last_activity = time.time()
             return True
         self.send_json(401, {"error": "Session ended, unlock again" if d.unlocked else "Wallet is locked"})
         return False
@@ -240,13 +376,6 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
     def do_GET(self):
         d = self.dev
         path = self.path.split("?")[0]
@@ -256,12 +385,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_body(200, (WEB / "index.html").read_bytes(), "text/html; charset=utf-8")
             elif path == "/device":
                 self.send_body(200, DEVICE_PAGE.encode(), "text/html; charset=utf-8")
-            elif path.startswith("/vendor/"):
-                f = WEB / path.lstrip("/")
-                if f.exists():
-                    self.send_body(200, f.read_bytes(), "font/woff2" if f.suffix == ".woff2" else "text/javascript")
-                else:
-                    self.send_json(404, {"error": "not found"})
+            elif path in ASSETS:
+                f = ASSETS[path]
+                self.send_body(200, f.read_bytes(), "font/woff2" if f.suffix == ".woff2" else "text/javascript")
             elif path == "/sim/state":
                 if time.time() < d.down_until:
                     self.send_json(200, {"screen": ["restarting...", "", "", ""], "hold": None, "led": False})
@@ -271,11 +397,12 @@ class Handler(BaseHTTPRequestHandler):
             elif self.restarting():
                 return
             elif path == "/api/state":
-                self.send_json(200, d.state(self.headers.get("Host", "localhost:8080")))
+                self.send_json(200, d.state(self.owns_session()))
             elif path == "/api/request":
-                if d.has_wallet and not self.session():
+                wiped = not d.has_wallet and d.req and d.req["kind"] == "wipe" and d.req["state"] == "done"
+                if not wiped and not self.session():
                     return
-                if not d.req:
+                if not d.req or ("?" in self.path and self.path != f"/api/request?id={d.req['id']}"):
                     self.send_json(404, {"error": "No request"})
                 else:
                     self.send_json(200, {"request": {k: v for k, v in d.req.items() if not k.startswith("_")}})
@@ -285,11 +412,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         d = self.dev
         b = self.body()
+        if b is None:
+            return
         p = self.path
         with d.lock:
             d.tick()
             if p == "/sim/button":
-                d.pressed = bool(b.get("down"))
+                if type(b.get("down")) is not bool:
+                    self.send_json(400, {"error": "Invalid button state"})
+                    return
+                d.pressed = b["down"]
                 d.tick()
                 self.send_json(200, {"ok": True})
                 return
@@ -303,44 +435,143 @@ class Handler(BaseHTTPRequestHandler):
             if self.restarting():
                 return
             if p == "/api/ap-password":
+                if (d.has_wallet or d.ap_pass != FACTORY_PASS) and not self.session():
+                    return
                 pw = b.get("password", "")
-                if len(pw) < 8 or pw == FACTORY_PASS:
-                    self.send_json(400, {"error": "Use 8 to 63 characters" if len(pw) < 8 else "Choose a password other than the factory one"})
+                if not isinstance(pw, str) or not re.fullmatch(r"[ -~]{8,63}", pw) or pw in (FACTORY_PASS, d.ap_pass, "admin123"):
+                    self.send_json(400, {"error": "Choose a new password of 8 to 63 printable characters"})
                     return
                 d.ap_pass = pw
-                d.unlocked, d.token = False, ""
+                d.end_session()
+                d.setup_token = d.pending_words = ""
                 d.screen = ["Solder", "WiFi password set", "Restarting...", ""]
                 self.send_json(200, {"restarting": True})
                 d.down_until = time.time() + 6
-                threading.Timer(6.2, lambda: setattr(d, "screen", ["Solder", "WiFi: Solder-3F2A", "Pass: (your password)", "Open 192.168.4.1"])).start()
+                d.paint()
                 return
-            if d.ap_pass == FACTORY_PASS and p in ("/api/setup/generate", "/api/setup/finish"):
-                self.send_json(428, {"error": "Change the WiFi password first"})
-                return
-            if p == "/api/setup/generate":
-                n = 24 if b.get("words") == 24 else 12
+            if p in ("/api/setup/generate", "/api/setup/finish", "/api/setup/cancel"):
+                if d.ap_pass == FACTORY_PASS:
+                    self.send_json(428, {"error": "Change the WiFi password first"})
+                    return
+                if d.has_wallet:
+                    self.send_json(409, {"error": "A wallet already exists"})
+                    return
+                if d.setup_token and d.setup_token != b.get("setupToken"):
+                    self.send_json(409, {"error": "Setup is in progress in another tab"})
+                    return
+            if p == "/api/setup/cancel":
+                d.setup_token = d.pending_words = ""
+                d.req = None
+                d.paint()
+                self.send_json(200, {"ok": True})
+            elif p == "/api/setup/generate":
+                if d.req and d.req["kind"] == "restore":
+                    self.send_json(409, {"error": "Cancel the restore first"})
+                    return
+                n = b.get("words", 12)
+                if type(n) is not int or n not in (12, 24):
+                    self.send_json(400, {"error": "Choose 12 or 24 words"})
+                    return
                 d.pending_words = " ".join(random.sample(WORDS, n))
-                self.send_json(200, {"words": d.pending_words})
+                d.setup_token, d.setup_time = secrets.token_hex(16), time.time()
+                self.send_json(200, {"words": d.pending_words, "setupToken": d.setup_token})
             elif p == "/api/setup/finish":
-                if len(b.get("pin", "")) < 6:
-                    self.send_json(400, {"error": "Use a PIN with at least 6 digits"})
+                staged = d.req and d.req["kind"] == "restore"
+                if staged and ("pin" in b or "mnemonic" in b):
+                    self.send_json(409, {"error": "A restore is already staged"})
+                    return
+                if staged and d.req["state"] == "expired":
+                    d.req = None
+                    d.setup_token = ""
+                    self.send_json(409, {"error": "Restore expired"})
+                    return
+                if staged and d.req["state"] == "waiting":
+                    self.send_json(202, {"pending": True, "setupToken": d.setup_token})
+                    return
+                if not staged and not b.get("pin") and b.get("setupToken"):
+                    self.send_json(409, {"error": "No pending restore"})
+                    return
+                pin = d.req["_pin"] if staged else b.get("pin")
+                if not isinstance(pin, str) or not re.fullmatch(r"[0-9]{6}", pin):
+                    self.send_json(400, {"error": "Use a six-digit PIN"})
+                    return
+                if d.pending_words and b.get("mnemonic"):
+                    self.send_json(409, {"error": "Cancel the generated backup before restoring"})
+                    return
+                words = d.req["_words"] if staged else b.get("mnemonic") or d.pending_words
+                if not isinstance(words, str) or len(words.split()) not in (12, 24):
+                    self.send_json(400, {"error": "Enter 12 or 24 words"})
+                    return
+                if not staged and b.get("mnemonic"):
+                    d.setup_token, d.setup_time = secrets.token_hex(16), time.time()
+                    d.req = {"kind": "restore", "state": "waiting", "_page": 0, "_words": words, "_pin": pin,
+                             "_t": time.time(), "hold": 0}
+                    d.wait_release, d.press_start = d.pressed, None
+                    d.paint()
+                    self.send_json(202, {"pending": True, "setupToken": d.setup_token})
                     return
                 time.sleep(1.2)  # PBKDF2 on the ESP32 takes about this long
-                d.has_wallet, d.pin, d.unlocked, d.token = True, b["pin"], True, secrets.token_hex(16)
+                d.has_wallet, d.pin, d.unlocked, d.token = True, pin, True, secrets.token_hex(16)
+                d.req = None
+                d.setup_token = d.pending_words = ""
+                d.last_activity = time.time()
                 d.paint()
                 self.send_json(200, {"token": d.token, "address": ADDRESS})
             elif p == "/api/unlock":
+                if not d.has_wallet:
+                    self.send_json(409, {"error": "No wallet"})
+                    return
+                if time.time() < d.pin_delay:
+                    self.send_json(403, {"error": "Wait a few seconds before the next try"})
+                    return
+                if d.fails >= 5:
+                    if d.req and d.req["state"] == "waiting":
+                        self.send_json(403, {"error": "Finish the pending request before unlocking"})
+                        return
+                    client, pin = b.get("pinClient"), b.get("pin")
+                    if not isinstance(client, str) or not re.fullmatch(r"[0-9a-f]{32}", client):
+                        self.send_json(403, {"error": "Reopen the wallet page before confirming a PIN attempt"})
+                        return
+                    if not isinstance(pin, str) or not re.fullmatch(r"[0-9]{6}", pin):
+                        self.send_json(403, {"error": "Enter a six-digit PIN"})
+                        return
+                    if not d.pin_client:
+                        d.pin_gate = True
+                        d.pin_client, d.pin_candidate = client, pin
+                        d.pin_allowed_until = time.time() + TIMEOUT_S
+                        d.press_start = None
+                        d.wait_release = d.pressed
+                        d.paint()
+                    elif not secrets.compare_digest(d.pin_client, client):
+                        self.send_json(403, {"error": "Another PIN confirmation is pending. Wait for it to expire."})
+                        return
+                    elif not secrets.compare_digest(d.pin_candidate, pin):
+                        self.send_json(403, {"error": "A different PIN is awaiting confirmation. Retry the original PIN or wait for it to expire."})
+                        return
+                    if d.pin_gate:
+                        self.send_json(403, {"error": "Hold and release BOOT, then try the PIN again"})
+                        return
+                d.clear_pin_gate()
                 time.sleep(0.9)
                 if b.get("pin") != d.pin:
                     d.fails += 1
+                    d.pin_delay = time.time() + d.fails
+                    if d.fails == 10:
+                        d.fails, d.has_wallet, d.pin = 0, False, ""
+                        d.end_session()
+                        self.send_json(403, {"error": "Too many wrong PINs. Restore with your backup words."})
+                        return
                     self.send_json(403, {"error": "Wrong PIN, %d tries left" % (10 - d.fails)})
                     return
+                d.end_session()
                 d.unlocked, d.token, d.fails = True, secrets.token_hex(16), 0
+                d.last_activity = time.time()
                 d.paint()
                 self.send_json(200, {"token": d.token, "address": ADDRESS})
             elif p == "/api/lock":
-                d.unlocked, d.token = False, ""
-                d.paint()
+                if not self.session():
+                    return
+                d.end_session()
                 self.send_json(200, {"ok": True})
             elif p in ("/api/send", "/api/sign", "/api/wipe"):
                 if not self.session():
@@ -350,37 +581,64 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if p == "/api/send":
                     to, amt, bh = b.get("to", ""), b.get("amount", ""), b.get("blockhash", "")
-                    if not (32 <= len(to) <= 44) or any(c not in B58 for c in to):
+                    if not isinstance(to, str) or not re.fullmatch(f"[{B58}]{{32,44}}", to) or to == ADDRESS:
                         self.send_json(400, {"error": "That is not a Solana address"})
                         return
-                    if not bh:
+                    if not isinstance(bh, str) or not re.fullmatch(f"[{B58}]{{32,44}}", bh):
                         self.send_json(400, {"error": "Missing recent blockhash, is your phone online?"})
                         return
-                    try:
-                        assert float(amt.replace(",", ".")) > 0
-                    except (ValueError, AssertionError):
-                        self.send_json(400, {"error": "Enter an amount with at most 9 decimals"})
-                        return
                     mint = b.get("mint") or ""
-                    req = {"kind": "send-token" if mint else "send", "to": to, "amount": amt.replace(",", "."), "symbol": mint[:4] if mint else "SOL"}
+                    decimals = b.get("decimals", 0) if mint else 9
+                    if mint and (not isinstance(mint, str) or not re.fullmatch(f"[{B58}]{{32,44}}", mint)
+                                 or type(decimals) is not int or not 0 <= decimals <= 18):
+                        self.send_json(400, {"error": "Unknown token"})
+                        return
+                    if not isinstance(amt, str) or not re.fullmatch(r"[0-9]{0,20}([.,][0-9]{0,18})?", amt):
+                        self.send_json(400, {"error": "Invalid amount"})
+                        return
+                    whole, _, frac = amt.replace(",", ".").partition(".")
+                    units = int(whole or 0) * 10 ** decimals + int(frac.ljust(decimals, "0") or 0)
+                    if len(frac) > decimals or not 0 < units <= 2**64 - 1:
+                        self.send_json(400, {"error": "Invalid amount"})
+                        return
+                    req = {"kind": "send-token" if mint else "send", "to": to, "amount": amt.replace(",", "."),
+                           "symbol": mint[:4] if mint else "SOL", "mint": mint, "_amount": units}
                 elif p == "/api/sign":
-                    if not b.get("message"):
-                        self.send_json(400, {"error": "Write a message up to 1024 characters"})
+                    message = b.get("message")
+                    if (not isinstance(message, str) or not message or ord(message[0]) < 32
+                            or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff]", message)
+                            or len(message.encode()) > 1024):
+                        self.send_json(400, {"error": "Write a text message up to 1024 bytes"})
                         return
                     req = {"kind": "sign-message", "message": b["message"]}
                 else:
                     req = {"kind": "wipe"}
-                req.update({"id": random.randint(1, 99999), "state": "waiting", "hold": 0, "expiresIn": TIMEOUT_S, "_t": time.time()})
+                req.update({"id": d.next_id, "state": "waiting", "hold": 0, "expiresIn": TIMEOUT_S, "_t": time.time(), "_page": 0})
+                d.next_id += 1
+                d.clear_pin_gate()
+                d.wait_release, d.press_start = d.pressed, None
                 d.req = req
                 d.paint()
                 self.send_json(200, {"request": {k: v for k, v in req.items() if not k.startswith("_")}})
             elif p == "/api/request/reject":
+                if not self.session():
+                    return
+                if not d.req or b.get("id") != d.req["id"]:
+                    self.send_json(409, {"error": "Request changed"})
+                    return
                 if d.req and d.req["state"] == "waiting":
                     d.req["state"] = "rejected"
                 d.paint()
                 self.send_json(200, {"request": {k: v for k, v in d.req.items() if not k.startswith("_")}})
             elif p == "/api/network":
-                d.network = b.get("network", "devnet")
+                if not self.session():
+                    return
+                network, mins = b.get("network"), b.get("autoLockMin", d.auto_lock_min)
+                if (network not in ("devnet", "mainnet", "custom") or type(mins) is not int or mins not in (0, 1, 5, 15)
+                        or (network == "custom" and not str(b.get("rpc", "")).startswith("https://"))):
+                    self.send_json(400, {"error": "Invalid settings"})
+                    return
+                d.network, d.auto_lock_min = network, mins
                 self.send_json(200, {"ok": True})
             else:
                 self.send_json(404, {"error": "Unknown endpoint"})
@@ -396,7 +654,7 @@ def main():
     print("  wallet: http://localhost:%d" % a.port)
     print("  device: http://localhost:%d/device   (hold BOOT here)" % a.port)
     print("  factory WiFi password: %s, PIN after setup: what you choose%s" % (FACTORY_PASS, " (ready mode: 123456)" if a.ready else ""))
-    ThreadingHTTPServer(("", a.port), Handler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", a.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

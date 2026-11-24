@@ -19,6 +19,13 @@ namespace display
         oled.setTextWrap(false);
     }
 
+    bool available()
+    {
+        if (!ready) return false;
+        Wire.beginTransmission(0x3C);
+        return Wire.endTransmission() == 0;
+    }
+
     static void head(const char *title)
     {
         oled.clearDisplay();
@@ -36,65 +43,131 @@ namespace display
         oled.print("WiFi: ");
         oled.print(apName);
         oled.setCursor(0, 28);
-        oled.print("Pass: ");
-        oled.print(apPass);
-        oled.setCursor(0, 44);
+        for (unsigned i = 0; i < apPass.length(); ++i)
+        {
+            if (i == 21) oled.setCursor(0, 36);
+            oled.write(apPass[i]);
+        }
+        oled.setCursor(0, 50);
         oled.print("Open 192.168.4.1");
         oled.display();
+    }
+
+    static constexpr unsigned columns = 21;
+
+    static void field(const String &value)
+    {
+        for (unsigned i = 0; i < value.length(); ++i)
+        {
+            if (i % columns == 0) oled.setCursor(0, 14 + (i / columns) * 8);
+            oled.write(value[i]);
+        }
     }
 
     void idle(const String &address, bool locked)
     {
         if (!ready) return;
         head(locked ? "Solder - locked" : "Solder - unlocked");
-        oled.setCursor(0, 16);
-        oled.print(address.length() ? solder::shortAddress(address) : String("-"));
-        oled.setCursor(0, 30);
+        oled.setCursor(0, 14);
+        if (address.length()) field(address);
+        else oled.print("-");
+        oled.setCursor(0, 40);
         oled.print("WiFi ");
-        oled.print(solder::settings.defaultPassword() ? "admin123" : "password set");
-        oled.setCursor(0, 44);
+        oled.print(solder::settings.defaultPassword() ? "setup required" : "password set");
+        oled.setCursor(0, 52);
         oled.print("http://192.168.4.1");
         oled.display();
     }
 
-    void request(const Request &r)
+    // At text size 1 the 128px display fits 21 columns. Keep every signed
+    // byte visible. Escape controls, UTF-8 bytes and the escape character.
+    static constexpr unsigned rows = 4;
+
+    static unsigned messagePages(const Request &r, int drawPage)
+    {
+        static const char hex[] = "0123456789ABCDEF";
+        unsigned line = 0, col = 0;
+        for (uint8_t b : r.message)
+        {
+            char escaped[] = {'\\', 'x', hex[b >> 4], hex[b & 15]};
+            bool plain = b >= 0x20 && b <= 0x7e && b != '\\';
+            unsigned width = plain ? 1 : 4;
+            if (col + width > columns)
+            {
+                ++line;
+                col = 0;
+            }
+            if ((int)(line / rows) == drawPage)
+            {
+                oled.setCursor(col * 6, 12 + (line % rows) * 8);
+                if (plain) oled.write(b);
+                else for (char c : escaped) oled.write(c);
+            }
+            col += width;
+        }
+        return 1 + line / rows;
+    }
+
+    unsigned reviewPages(const Request &r)
+    {
+        switch (r.kind)
+        {
+        case ReqKind::SendSol: return 2;
+        case ReqKind::SendToken: return 3;
+        case ReqKind::SignMessage: return messagePages(r, -1);
+        case ReqKind::Wipe: return 1;
+        }
+        return 0;
+    }
+
+    void request(const Request &r, unsigned page)
     {
         if (!ready) return;
+        unsigned pages = reviewPages(r);
         switch (r.kind)
         {
         case ReqKind::SendSol:
         case ReqKind::SendToken:
-            head("Send");
-            oled.setTextSize(2);
-            oled.setCursor(0, 14);
-            oled.print(r.amountText);
-            oled.setTextSize(1);
-            oled.print(" ");
-            oled.print(r.symbol);
-            oled.setCursor(0, 34);
-            oled.print("to ");
-            oled.print(solder::shortAddress(r.to));
+            if (page == 0)
+            {
+                const char *title = r.kind == ReqKind::SendSol ? "Send SOL"
+                    : r.tokenProgram == INFRATIC_TOKEN_2022_PROGRAM_ID ? "Send Token-2022" : "Send SPL token";
+                head(title);
+                field(r.amountText);
+                // An offline signer cannot verify the cluster of a blockhash.
+                oled.setCursor(0, 36);
+                oled.print("Can spend real funds");
+            }
+            else if (page == 1 && r.kind == ReqKind::SendToken)
+            {
+                head("Token mint");
+                field(r.mint);
+            }
+            else
+            {
+                head("Recipient");
+                field(r.to);
+            }
             break;
         case ReqKind::SignMessage:
             head("Sign message");
-            oled.setCursor(0, 14);
-            for (size_t i = 0; i < r.message.size() && i < 42; i++)
-            {
-                char c = (char)r.message[i];
-                oled.print(c >= 32 && c < 127 ? c : '.');
-                if (i == 20) oled.setCursor(0, 24);
-            }
+            messagePages(r, page);
             break;
         case ReqKind::Wipe:
             head("ERASE WALLET");
             oled.setCursor(0, 16);
             oled.print("Keys are deleted.");
             oled.setCursor(0, 26);
-            oled.print("Only the words restore.");
+            oled.print("Restore with backup.");
             break;
         }
+        if (pages > 1)
+        {
+            oled.setCursor(96, 0);
+            oled.printf("%u/%u", page + 1, pages);
+        }
         oled.setCursor(0, 46);
-        oled.print("Hold BOOT to approve");
+        oled.print(page + 1 < pages ? "Tap BOOT for next" : "Hold BOOT to approve");
         oled.drawRect(0, 56, 128, 8, SSD1306_WHITE);
         oled.fillRect(0, 56, (int)(128 * r.hold), 8, SSD1306_WHITE);
         oled.display();
@@ -104,21 +177,21 @@ namespace display
     {
         if (!ready) return;
         head("Backup words");
-        int idx = 0, start = 0, shown = 0;
-        String m = mnemonic + " ";
-        for (int i = 0; i < (int)m.length(); i++)
+        int index = 0;
+        for (unsigned i = 0; i < mnemonic.length(); ++i)
         {
-            if (m[i] != ' ') continue;
-            if (idx >= page * 6 && idx < page * 6 + 6)
+            if (mnemonic[i] == ' ')
             {
-                oled.setCursor((shown % 2) * 64, 14 + (shown / 2) * 12);
-                oled.print(idx + 1);
-                oled.print(".");
-                oled.print(m.substring(start, i));
-                shown++;
+                ++index;
+                continue;
             }
-            idx++;
-            start = i + 1;
+            if (index / 6 != page) continue;
+            if (i == 0 || mnemonic[i - 1] == ' ')
+            {
+                oled.setCursor(0, 14 + (index % 6) * 8);
+                oled.printf("%d. ", index + 1);
+            }
+            oled.write(mnemonic[i]);
         }
         oled.display();
     }
@@ -142,7 +215,9 @@ namespace display
     void begin() {}
     void boot(const String &, const String &) {}
     void idle(const String &, bool) {}
-    void request(const Request &) {}
+    bool available() { return true; }
+    unsigned reviewPages(const Request &) { return 1; }
+    void request(const Request &, unsigned) {}
     void words(const String &, int) {}
     void text(const String &, const String &) {}
 }
