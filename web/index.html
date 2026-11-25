@@ -330,7 +330,7 @@ textarea.input { min-height: 120px; resize: vertical; line-height: 1.6; }
 
     <!-- create: backup words -->
     <section class="view" id="v-create">
-      <button class="back" data-back>‹ Back</button>
+      <button class="back" id="createBack" data-back>‹ Back</button>
       <h2>Backup words</h2>
       <p class="lede">These words are the wallet. Write them on paper in this order and keep it somewhere safe. Anyone with them can take your funds.</p>
       <div class="seg" id="wordCount" style="margin-top:18px">
@@ -346,6 +346,15 @@ textarea.input { min-height: 120px; resize: vertical; line-height: 1.6; }
       <div class="stack">
         <button class="pad wide" id="wroteBtn" disabled>I wrote them down</button>
       </div>
+    </section>
+
+    <!-- create: check the paper backup on the OLED -->
+    <section class="view" id="v-paper">
+      <button class="back" data-back>‹ Cancel setup</button>
+      <h2>Check your paper backup</h2>
+      <p class="lede">Find each numbered word on your paper. On Solder, tap BOOT to change the selected word, then hold BOOT for 1.5 seconds to choose it.</p>
+      <p class="note" id="paperStatus" role="status"></p>
+      <div class="stack"><button class="pad wide" id="reviewPaper" hidden>Review my words</button></div>
     </section>
 
     <!-- create: check -->
@@ -633,6 +642,28 @@ function show(name, dir = "fwd", push = true) {
 }
 async function back() {
   if (current === "pin" && pinBusy) return;
+  if (current === "paper" || (current === "create" && state.info.screen)) {
+    const view = $("#v-" + current);
+    if (view.inert) return;
+    view.inert = true;
+    ++paperRun;
+    try {
+      await generationQueue;
+      await api("setup/cancel", { setupToken: state.setupToken });
+    } catch (e) {
+      if (e.status !== 409) {
+        toast(e.message);
+        if (current === "paper") checkPaper("status");
+        return;
+      }
+    } finally { view.inert = false; }
+    forgetSetup(true); reset("welcome"); return;
+  }
+  if (current === "pin" && oledWordCount() && state.pinMode !== "unlock") {
+    state.pinFirst = "";
+    reset("create");
+    return;
+  }
   if (restoreClaim) {
     try { await api("setup/cancel", { setupToken: restoreClaim }); }
     catch (e) { toast(e.message); return; }
@@ -679,6 +710,7 @@ function forgetSetup(finished = false) {
     state.setupToken = restoreClaim = "";
     sessionStorage.removeItem("setupToken");
     sessionStorage.removeItem("restorePending");
+    sessionStorage.removeItem("oledWordCount");
   }
   $("#restoreWords").value = "";
   $("#wordList").replaceChildren();
@@ -762,6 +794,7 @@ async function waitForRestart() {
 
 // ---------- setup: words -------------------------------------------------
 $$("#wordCount button").forEach((b) => b.onclick = () => {
+  if (oledWordCount() === state.wordCount && +b.dataset.n === state.wordCount) return;
   $$("#wordCount button").forEach((x) => x.classList.toggle("on", x === b));
   state.wordCount = +b.dataset.n;
   makeWords();
@@ -771,6 +804,7 @@ async function makeWords() {
   const generation = ++wordGeneration;
   const count = state.wordCount;
   state.setupWords = state.mnemonic = "";
+  $("#screenWords").hidden = true;
   $("#wroteBtn").disabled = true;
   $("#revealBtn").disabled = true;
   $("#revealBtn").hidden = false;
@@ -782,31 +816,15 @@ async function makeWords() {
       const r = await api("setup/generate", { words: count, setupToken: state.setupToken });
       state.setupToken = r.setupToken;
       sessionStorage.setItem("setupToken", r.setupToken);
+      if (r.onScreen) sessionStorage.setItem("oledWordCount", String(r.count));
+      else sessionStorage.removeItem("oledWordCount");
       return r;
     });
     generationQueue = generate.catch(() => {});
     const r = await generate;
     if (generation !== wordGeneration || current !== "create") return;
     if (r.onScreen) {
-      list.hidden = true;
-      $("#revealBtn").hidden = true;
-      $("#screenWords").hidden = false;
-      const pages = $("#wordPages");
-      pages.innerHTML = "";
-      for (let p = 0; p < r.count / 6; p++) {
-        const b = document.createElement("button");
-        b.textContent = (p * 6 + 1) + "-" + (p * 6 + 6);
-        b.className = p === 0 ? "on" : "";
-        b.onclick = async () => {
-          $$("#wordPages button").forEach((x) => x.classList.toggle("on", x === b));
-          try {
-            await api("setup/words", { page: p, setupToken: r.setupToken });
-            if (p === r.count / 6 - 1) $("#wroteBtn").disabled = false;
-          } catch (e) { toast(e.message); }
-        };
-        pages.appendChild(b);
-      }
-      state.setupWords = "";
+      showOledWords(r.count, false);
       return;
     }
     state.setupWords = r.words;
@@ -820,6 +838,76 @@ async function makeWords() {
   } catch (e) { toast(e.message); }
 }
 
+function oledWordCount() {
+  const n = Number(sessionStorage.getItem("oledWordCount"));
+  return state.info?.screen && state.setupToken && (n === 12 || n === 24) ? n : 0;
+}
+
+function showOledWords(count, reopen) {
+  state.wordCount = count;
+  $$("#wordCount button").forEach(b => b.classList.toggle("on", +b.dataset.n === count));
+  $("#wordList").hidden = $("#revealBtn").hidden = true;
+  $("#screenWords").hidden = false;
+  $("#wroteBtn").disabled = true;
+  const pages = $("#wordPages"), token = state.setupToken, generation = wordGeneration;
+  pages.replaceChildren();
+  for (let page = 0; page < count / 6; page++) {
+    const b = document.createElement("button");
+    b.textContent = (page * 6 + 1) + "-" + (page * 6 + 6);
+    b.classList.toggle("on", page === 0);
+    b.onclick = async () => {
+      try {
+        await api("setup/words", { page, setupToken: token });
+        if (token !== state.setupToken || current !== "create" || generation !== wordGeneration) return;
+        $$("#wordPages button").forEach(x => x.classList.toggle("on", x === b));
+        if (page === count / 6 - 1) $("#wroteBtn").disabled = false;
+      } catch (e) { toast(e.message); }
+    };
+    pages.appendChild(b);
+  }
+  if (reopen) pages.firstElementChild.click();
+}
+
+let paperRun = 0;
+async function checkPaper(action) {
+  const run = ++paperRun, token = state.setupToken;
+  show("paper");
+  const active = () => current === "paper" && token === state.setupToken && run === paperRun;
+  const status = $("#paperStatus");
+  $("#reviewPaper").hidden = true;
+  status.textContent = "Checking with Solder…";
+  while (active()) {
+    try {
+      const r = await api("setup/check", { setupToken: token, action }, { timeout: 5000 });
+      if (!active()) return;
+      if (r.state === "verified") { startPin("set"); return; }
+      if (r.state === "idle") { reset("create"); return; }
+      if (r.state === "incorrect") {
+        status.textContent = "That word did not match. Compare your paper with the original words on Solder, then try again.";
+        $("#reviewPaper").hidden = false;
+        return;
+      }
+      status.textContent = "Answer all three questions on Solder to continue to your PIN.";
+    } catch (e) {
+      if (!active()) return;
+      if (e.status === 409) {
+        forgetSetup(true);
+        reset("welcome");
+        toast(e.message);
+        return;
+      }
+      if (e.status && e.status !== 503 && e.status !== 500) {
+        status.textContent = e.message;
+        return;
+      }
+      status.textContent = e.message + " Reconnecting…";
+    }
+    action = "status";
+    await sleep(800);
+  }
+}
+$("#reviewPaper").onclick = () => reset("create");
+
 $("#revealBtn").onclick = () => {
   const list = $("#wordList");
   const hidden = list.classList.toggle("hidden");
@@ -832,7 +920,8 @@ $("#revealBtn").onclick = () => {
 
 let wordGeneration = 0, generationQueue = Promise.resolve();
 $("#wroteBtn").onclick = () => {
-  if (!state.setupWords) { state.mnemonic = ""; startPin("set"); return; }
+  if (oledWordCount()) { checkPaper("start"); return; }
+  if (!state.setupWords) return;
   const words = state.setupWords.split(" ");
   const picks = new Set();
   while (picks.size < 3) picks.add(Math.floor(Math.random() * words.length));
@@ -864,6 +953,7 @@ $("#restoreBtn").onclick = async () => {
     try { await api("setup/cancel", { setupToken: state.setupToken }); }
     catch (e) { $("#restoreErr").textContent = e.message; return; }
     state.setupToken = ""; sessionStorage.removeItem("setupToken");
+    sessionStorage.removeItem("oledWordCount");
   }
   state.mnemonic = w.join(" ");
   startPin("set");
@@ -1435,7 +1525,15 @@ $("#wipeBtn").onclick = async () => {
 
 // ---------- view hooks ---------------------------------------------------
 const views = {
-  create: () => { $("#screenWords").hidden = true; $("#wordList").hidden = false; $("#revealBtn").textContent = "Show words"; makeWords(); },
+  create: () => {
+    $("#createBack").textContent = state.info.screen ? "‹ Cancel setup" : "‹ Back";
+    const count = oledWordCount();
+    if (count) { showOledWords(count, true); return; }
+    $("#screenWords").hidden = true;
+    $("#wordList").hidden = false;
+    $("#revealBtn").textContent = "Show words";
+    makeWords();
+  },
   pin: () => {
     pin = ""; paintPin(); $("#pinErr").textContent = "";
     const m = state.pinMode;
@@ -1467,6 +1565,10 @@ const views = {
   const i = state.info;
   if (i.restorePending && state.setupToken && sessionStorage.getItem("restorePending")) { waitForRestore(state.setupToken); return; }
   if (sessionStorage.getItem("restorePending")) forgetSetup(true);
+  if (oledWordCount() && !i.hasWallet && !i.defaultPassword) {
+    checkPaper("status");
+    return;
+  }
   if (i.unlocked && state.token && i.hasWallet && !i.defaultPassword) {
     const token = state.token;
     try {

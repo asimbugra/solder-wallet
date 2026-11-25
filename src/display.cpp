@@ -196,6 +196,25 @@ namespace display
         oled.display();
     }
 
+    void backupQuestion(unsigned question, unsigned position, const char *const choices[3], unsigned selected)
+    {
+        if (!ready) return;
+        head("Backup check");
+        oled.setCursor(96, 0);
+        oled.printf("%u/3", question);
+        oled.setCursor(0, 13);
+        oled.printf("Word #%u?", position);
+        for (unsigned i = 0; i < 3; ++i)
+        {
+            oled.setCursor(0, 24 + i * 10);
+            oled.print(i == selected ? "> " : "  ");
+            for (const char *p = choices[i]; *p && *p != ' '; ++p) oled.write(*p);
+        }
+        oled.setCursor(0, 56);
+        oled.print("Tap:next  Hold:pick");
+        oled.display();
+    }
+
     void text(const String &line1, const String &line2)
     {
         if (!ready) return;

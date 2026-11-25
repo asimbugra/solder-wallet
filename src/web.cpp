@@ -14,6 +14,7 @@ extern "C" {
 #include <ArduinoJson.h>
 #include <base58.h>
 #include <atomic>
+#include <algorithm>
 
 static DNSServer dns;
 static std::atomic<bool> accepting{false};
@@ -31,6 +32,19 @@ struct Restore
     bool rawPressed = false, armed = false, holding = false, approved = false;
 };
 static Restore restore;
+
+#if SOLDER_OLED
+enum class BackupPhase { Idle, Checking, Incorrect, Verified };
+struct BackupCheck
+{
+    BackupPhase phase = BackupPhase::Idle;
+    unsigned wordCount = 0, question = 0, positions[3] = {}, selected = 0, correct = 0;
+    const char *choices[3] = {};
+    uint32_t sampledAt = 0, changedAt = 0;
+    bool rawDown = false, stableDown = true, pressing = false;
+};
+static BackupCheck backupCheck;
+#endif
 
 // The HTTP task reads a bounded request before handing it to the Arduino loop.
 // All wallet, button and display operations stay on that one loop.
@@ -74,6 +88,9 @@ static bool session(bool touch = true)
 
 static void clearSetup()
 {
+#if SOLDER_OLED
+    backupCheck = BackupCheck();
+#endif
     if (restore.words.length()) mbedtls_platform_zeroize(restore.words.begin(), restore.words.length());
     if (restore.pin.length()) mbedtls_platform_zeroize(restore.pin.begin(), restore.pin.length());
     restore = Restore();
@@ -95,13 +112,13 @@ static void issueSetupToken()
     setupActivity = millis();
 }
 
-static bool setupOwner()
+static bool setupOwner(bool touch = true)
 {
     JsonString supplied = in["setupToken"].as<JsonString>();
     if (setupToken[0] && supplied.size() == 32 &&
         mbedtls_ct_memcmp(supplied.c_str(), setupToken, 32) == 0)
     {
-        setupActivity = millis();
+        if (touch) setupActivity = millis();
         return true;
     }
     fail(409, "Backup session changed. Return to the tab that created the words or start again after it expires.");
@@ -287,6 +304,9 @@ static void handleGenerate()
         fail(400, "Choose 12 or 24 words");
         return;
     }
+#if SOLDER_OLED
+    backupCheck = BackupCheck();
+#endif
     const String &words = solder::generateMnemonic(count);
     if (!words.length())
     {
@@ -308,6 +328,144 @@ static void handleGenerate()
     sendJson(200, d);
 }
 
+#if SOLDER_OLED
+// Refer to words in the pending phrase without making extra copies.
+static const char *wordAtPosition(const char *words, unsigned position)
+{
+    while (position--) words = strchr(words, ' ') + 1;
+    return words;
+}
+
+static bool sameBackupWord(const char *a, const char *b)
+{
+    const size_t length = strcspn(a, " ");
+    return strncmp(a, b, length) == 0 && (b[length] == ' ' || b[length] == '\0');
+}
+
+static void drawBackupQuestion()
+{
+    display::backupQuestion(backupCheck.question + 1, backupCheck.positions[backupCheck.question] + 1,
+                            backupCheck.choices, backupCheck.selected);
+}
+
+static void prepareBackupQuestion()
+{
+    const char *words = solder::pendingMnemonic().c_str();
+    const char *options[3] = {wordAtPosition(words, backupCheck.positions[backupCheck.question])};
+    // Use other words on the paper so the position matters. Valid phrases
+    // with fewer than three distinct words need extra BIP39 choices.
+    static const char *const extra[] = {"ability", "cactus", "yellow"};
+    const unsigned count = backupCheck.wordCount;
+    const unsigned start = esp_random() % count;
+    unsigned filled = 1;
+    for (unsigned n = 0; filled < 3 && n < count + 3; ++n)
+    {
+        const char *choice = n < count ? wordAtPosition(words, (start + n) % count) : extra[n - count];
+        if (sameBackupWord(choice, options[0]) || (filled == 2 && sameBackupWord(choice, options[1]))) continue;
+        options[filled++] = choice;
+    }
+    backupCheck.correct = esp_random() % 3;
+    backupCheck.selected = 0;
+    for (unsigned i = 0; i < 3; ++i)
+        backupCheck.choices[(backupCheck.correct + i) % 3] = options[i];
+    drawBackupQuestion();
+}
+
+static void startBackupCheck()
+{
+    backupCheck = BackupCheck();
+    const String &words = solder::pendingMnemonic();
+    const unsigned count = 1 + std::count(words.c_str(), words.c_str() + words.length(), ' ');
+    backupCheck.wordCount = count;
+    unsigned positions[24];
+    for (unsigned i = 0; i < count; ++i) positions[i] = i;
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        const unsigned pick = i + esp_random() % (count - i);
+        std::swap(positions[i], positions[pick]);
+        backupCheck.positions[i] = positions[i];
+    }
+    backupCheck.phase = BackupPhase::Checking;
+    backupCheck.sampledAt = backupCheck.changedAt = setupActivity = millis();
+    backupCheck.rawDown = digitalRead(SOLDER_BUTTON_PIN) == LOW;
+    prepareBackupQuestion();
+}
+
+static void handleBackupCheck()
+{
+    if (!setupOwner(false) || !setupDisplay()) return;
+    if (solder::store.exists() || !solder::pendingMnemonic().length())
+    {
+        fail(409, "No generated backup to check");
+        return;
+    }
+    const char *action = in["action"] | "";
+    if (!strcmp(action, "start"))
+    {
+        if (backupCheck.phase == BackupPhase::Idle || backupCheck.phase == BackupPhase::Incorrect) startBackupCheck();
+    }
+    else if (strcmp(action, "status")) { fail(400, "Choose start or status"); return; }
+    StaticJsonDocument<64> d;
+    switch (backupCheck.phase)
+    {
+    case BackupPhase::Idle:      d["state"] = "idle"; break;
+    case BackupPhase::Checking:  d["state"] = "checking"; break;
+    case BackupPhase::Incorrect: d["state"] = "incorrect"; break;
+    case BackupPhase::Verified:  d["state"] = "verified"; break;
+    }
+    sendJson(200, d);
+}
+
+static void reviewBackupCheck(uint32_t now)
+{
+    if (backupCheck.phase != BackupPhase::Checking) return;
+    const bool down = digitalRead(SOLDER_BUTTON_PIN) == LOW;
+    // A button already held when the check starts, or through a gap in
+    // sampling, needs a stable release before it can select anything.
+    if (now - backupCheck.sampledAt > 250)
+    {
+        backupCheck.stableDown = true;
+        backupCheck.pressing = false;
+        backupCheck.changedAt = now;
+    }
+    backupCheck.sampledAt = now;
+    if (down != backupCheck.rawDown)
+    {
+        backupCheck.rawDown = down;
+        backupCheck.changedAt = now;
+    }
+    const uint32_t elapsed = now - backupCheck.changedAt;
+    if (elapsed < 40) return;
+    if (down != backupCheck.stableDown)
+    {
+        backupCheck.stableDown = down;
+        if (!down && backupCheck.pressing)
+        {
+            if (!display::available()) { clearSetup(); return; }
+            backupCheck.selected = (backupCheck.selected + 1) % 3;
+            setupActivity = now;
+            drawBackupQuestion();
+        }
+        backupCheck.pressing = down;
+    }
+    if (!down || !backupCheck.pressing || elapsed < SOLDER_HOLD_MS) return;
+    backupCheck.pressing = false;
+    if (!display::available()) { clearSetup(); return; }
+    setupActivity = now;
+    if (backupCheck.selected != backupCheck.correct)
+    {
+        backupCheck.phase = BackupPhase::Incorrect;
+        display::text("Check your paper", "Retry from phone");
+    }
+    else if (++backupCheck.question == 3)
+    {
+        backupCheck.phase = BackupPhase::Verified;
+        display::text("Backup checked", "Set PIN on phone");
+    }
+    else prepareBackupQuestion();
+}
+#endif
+
 static void handleWordsPage()
 {
     if (!passwordChanged() || !setupOwner()) return;
@@ -317,12 +475,17 @@ static void handleWordsPage()
         fail(409, "No backup words to show");
         return;
     }
-    if (!in["page"].is<unsigned>() || in["page"].as<unsigned>() > 3)
+#if SOLDER_OLED
+    if (backupCheck.phase == BackupPhase::Checking) { fail(409, "Finish the backup check on Solder"); return; }
+#endif
+    const String &words = solder::pendingMnemonic();
+    const unsigned pages = (1 + std::count(words.c_str(), words.c_str() + words.length(), ' ')) / 6;
+    if (!in["page"].is<unsigned>() || in["page"].as<unsigned>() >= pages)
     {
         fail(400, "Invalid backup page");
         return;
     }
-    display::words(solder::pendingMnemonic(), in["page"].as<int>());
+    display::words(words, in["page"].as<int>());
     StaticJsonDocument<32> d;
     d["ok"] = true;
     sendJson(200, d);
@@ -423,6 +586,13 @@ static void handleFinish()
         return;
     }
     if (importing && !restore.approved) { pendingRestore(); return; }
+#if SOLDER_OLED
+    if (!importing && backupCheck.phase != BackupPhase::Verified)
+    {
+        fail(409, "Check the paper backup on Solder before setting a PIN");
+        return;
+    }
+#endif
     if (!setupDisplay()) return;
     String pin = importing ? restore.pin : String(enteredPin);
     const String &words = importing ? restore.words : solder::pendingMnemonic();
@@ -740,6 +910,9 @@ static const Route routes[] = {
     {"/api/ap-password", HTTP_POST, handleApPassword},
     {"/api/setup/generate", HTTP_POST, handleGenerate},
     {"/api/setup/words", HTTP_POST, handleWordsPage},
+#if SOLDER_OLED
+    {"/api/setup/check", HTTP_POST, handleBackupCheck},
+#endif
     {"/api/setup/finish", HTTP_POST, handleFinish},
     {"/api/setup/cancel", HTTP_POST, handleCancelSetup},
     {"/api/unlock", HTTP_POST, handleUnlock},
@@ -1071,6 +1244,9 @@ namespace web
             display::idle("", true);
         }
         if (restore.words.length()) reviewRestore(now);
+#if SOLDER_OLED
+        reviewBackupCheck(now);
+#endif
         if (requestReady && xSemaphoreTake(requestReady, 0) == pdTRUE)
         {
             dispatch();

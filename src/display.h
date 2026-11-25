@@ -12,5 +12,8 @@ namespace display
     unsigned reviewPages(const Request &r);
     void request(const Request &r, unsigned page = 0);
     void words(const String &mnemonic, int page);
+#if SOLDER_OLED
+    void backupQuestion(unsigned question, unsigned position, const char *const choices[3], unsigned selected);
+#endif
     void text(const String &line1, const String &line2 = "");
 }

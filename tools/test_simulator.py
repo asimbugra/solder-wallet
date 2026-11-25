@@ -100,8 +100,10 @@ class SimulatorTests(unittest.TestCase):
 
     def test_generated_backup_is_bound_to_setup_owner(self):
         self.dev.has_wallet = False
+        self.dev.oled = False
         first = json.load(self.call("/api/setup/generate", {"words": 12}))
         self.assertEqual(len(first["words"].split()), 12)
+        self.assertEqual(self.call("/api/setup/check", {"action": "start", "setupToken": first["setupToken"]}).status, 404)
         self.assertEqual(self.call("/api/setup/generate", {"words": 24}).status, 409)
         self.assertEqual(self.call("/api/setup/finish", {"pin": "123456"}).status, 409)
         new = json.load(self.call("/api/setup/generate", {"words": 24, "setupToken": first["setupToken"]}))
@@ -109,6 +111,99 @@ class SimulatorTests(unittest.TestCase):
         self.assertEqual(self.call("/api/setup/finish", {"pin": "123456", "setupToken": first["setupToken"]}).status, 409)
         self.assertEqual(self.call("/api/setup/finish", {"pin": "123456", "setupToken": new["setupToken"]}).status, 200)
         self.assertFalse(self.dev.pending_words)
+
+    def test_oled_paper_copy_and_button_check(self):
+        for count in (12, 24):
+            with self.subTest(count=count):
+                self.dev.has_wallet = False
+                created = json.load(self.call("/api/setup/generate", {"words": count}))
+                owner = {"setupToken": created["setupToken"]}
+                self.assertEqual(created, {**owner, "onScreen": True, "count": count})
+                paper = []
+                for page in range(count // 6):
+                    self.assertEqual(self.call("/api/setup/words", {**owner, "page": page}).status, 200)
+                    screen = json.load(self.call("/sim/state"))["screen"]
+                    paper.extend(line.split(". ")[1] for line in screen[1:])
+                self.assertEqual(len(paper), count)
+
+                def check(action):
+                    return json.load(self.call("/api/setup/check", {**owner, "action": action}))
+
+                finish = {**owner, "pin": "123456"}
+                self.assertEqual(check("status"), {"state": "idle"})
+                self.assertEqual(self.call("/api/setup/finish", finish).status, 409)
+                self.call("/sim/button", {"down": True})
+                self.assertEqual(check("start"), {"state": "checking"})
+                first_question = self.dev.screen[:]
+                self.clock.return_value += 2
+                self.call("/sim/button", {"down": False})
+                self.assertEqual(check("start"), {"state": "checking"})
+                self.assertEqual(self.dev.screen, first_question)
+                self.assertEqual(self.call("/api/setup/words", {**owner, "page": 0}).status, 409)
+
+                # Submit one wrong word, then review the original (unchanged) copy.
+                _, question, *options, _ = first_question
+                correct = paper[int(question.removeprefix("Word #").removesuffix("?")) - 1]
+                if options[0].strip("> ") == correct:
+                    self.press(0.2)
+                self.press(1.6)
+                self.assertEqual(check("status"), {"state": "incorrect"})
+                self.assertEqual(self.call("/api/setup/finish", finish).status, 409)
+                self.call("/api/setup/words", {**owner, "page": 0})
+                self.assertEqual([s.split(". ")[1] for s in self.dev.screen[1:]], paper[:6])
+                self.assertEqual(check("start"), {"state": "checking"})
+
+                asked = set()
+                for _ in range(3):
+                    _, question, *options, _ = json.load(self.call("/sim/state"))["screen"]
+                    pos = int(question.removeprefix("Word #").removesuffix("?")) - 1
+                    self.assertNotIn(pos, asked)
+                    asked.add(pos)
+                    choices = [w.strip("> ") for w in options]
+                    self.assertEqual(len(set(choices)), 3)
+                    self.assertTrue(set(choices).issubset(paper))
+                    for _ in range(choices.index(paper[pos])):
+                        self.press(0.2)
+                    self.assertEqual(self.call("/api/setup/finish", finish).status, 409)
+                    self.call("/sim/button", {"down": True})
+                    self.clock.return_value += 1.6
+                    answer = check("status")
+                    self.clock.return_value += 3
+                    self.assertEqual(check("status"), answer)
+                    self.call("/sim/button", {"down": False})
+                self.assertEqual(check("status"), {"state": "verified"})
+                self.assertEqual(check("start"), {"state": "verified"})
+                self.assertEqual(self.call("/api/setup/finish", finish).status, 200)
+                self.assertFalse(self.dev.pending_words)
+
+    def test_check_choices_for_repeated_words(self):
+        self.dev.pending_words = " ".join(["ability"] * 12)
+        self.dev.start_check()
+        for _, choices in self.dev.questions:
+            self.assertCountEqual(choices, ["ability", "cactus", "yellow"])
+
+    def test_oled_check_is_bound_to_one_setup_and_expires_without_button_activity(self):
+        self.dev.has_wallet = False
+        first = json.load(self.call("/api/setup/generate", {"words": 12}))["setupToken"]
+        start = {"setupToken": first, "action": "start"}
+        self.assertEqual(self.call("/api/setup/check", {"action": "start"}).status, 409)
+        self.assertEqual(self.call("/api/setup/check", start).status, 200)
+        new = json.load(self.call("/api/setup/generate", {"words": 24, "setupToken": first}))["setupToken"]
+        self.assertEqual(self.call("/api/setup/check", start).status, 409)
+        status = {"action": "status", "setupToken": new}
+        self.assertEqual(json.load(self.call("/api/setup/check", status)), {"state": "idle"})
+        self.call("/api/setup/check", {**status, "action": "start"})
+        self.clock.return_value += 899
+        self.assertEqual(json.load(self.call("/api/setup/check", status)), {"state": "checking"})
+        self.clock.return_value += 2
+        self.assertEqual(self.call("/api/setup/check", status).status, 409)
+        self.assertFalse(self.dev.pending_words)
+        self.assertFalse(self.dev.questions)
+        new = json.load(self.call("/api/setup/generate", {"words": 12}))["setupToken"]
+        self.call("/api/setup/check", {**start, "setupToken": new})
+        self.assertEqual(self.call("/api/setup/cancel", {"setupToken": new}).status, 200)
+        self.assertEqual(self.call("/api/setup/finish", {"setupToken": new, "pin": "123456"}).status, 409)
+        self.assertFalse(self.dev.questions)
 
     def test_staged_restore_needs_all_pages_and_owner(self):
         self.dev.has_wallet = False
