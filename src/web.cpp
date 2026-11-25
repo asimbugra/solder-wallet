@@ -701,34 +701,33 @@ static void handleLock()
 // requests that need the button
 // ---------------------------------------------------------------------------
 
-static void handleSend()
+static bool readTransfer(Request &r)
 {
-    if (!session()) return;
-    Request r;
+    if (!session()) return false;
     r.to = in["to"] | "";
     r.to.trim();
     r.amountText = in["amount"] | "";
     if (in.containsKey("mint") && !in["mint"].is<const char *>())
     {
         fail(400, "Invalid token mint");
-        return;
+        return false;
     }
     r.mint = in["mint"] | "";
     r.blockhash = in["blockhash"] | "";
     if (!decode32(r.to))
     {
         fail(400, "That is not a Solana address");
-        return;
+        return false;
     }
     if (r.to == solder::address())
     {
         fail(400, "This is your own address");
-        return;
+        return false;
     }
     if (!decode32(r.blockhash))
     {
         fail(400, "Missing recent blockhash, is your phone online?");
-        return;
+        return false;
     }
 
     if (r.mint.length())
@@ -741,7 +740,7 @@ static void handleSend()
             !decode32(r.mint) || (prog != INFRATIC_TOKEN_PROGRAM_ID && prog != INFRATIC_TOKEN_2022_PROGRAM_ID))
         {
             fail(400, "Unknown token");
-            return;
+            return false;
         }
         r.kind = ReqKind::SendToken;
         r.decimals = in["decimals"] | 0;
@@ -757,8 +756,35 @@ static void handleSend()
     if (!parseAmount(r.amountText, r.decimals, r.amount))
     {
         fail(400, "Enter an amount with at most " + String(r.decimals) + " decimals");
+        return false;
+    }
+    return true;
+}
+
+static void handleSendPreview()
+{
+    Request r;
+    if (!readTransfer(r)) return;
+    TransferPreview preview;
+    if (!solder::previewTransfer(r, preview))
+    {
+        fail(500, "Could not build the transfer preview");
         return;
     }
+    char units[21];
+    snprintf(units, sizeof(units), "%llu", static_cast<unsigned long long>(r.amount));
+    StaticJsonDocument<192> d;
+    d["amountUnits"] = static_cast<const char *>(units);
+    d["message"] = preview.message.c_str();
+    if (preview.destinationAccount.length()) d["destinationAccount"] = preview.destinationAccount.c_str();
+    if (preview.sizeTransaction.length()) d["sizeTransaction"] = preview.sizeTransaction.c_str();
+    sendJson(200, d);
+}
+
+static void handleSend()
+{
+    Request r;
+    if (!readTransfer(r)) return;
     String error;
     if (!solder::startRequest(r, error))
     {
@@ -917,6 +943,7 @@ static const Route routes[] = {
     {"/api/setup/cancel", HTTP_POST, handleCancelSetup},
     {"/api/unlock", HTTP_POST, handleUnlock},
     {"/api/lock", HTTP_POST, handleLock},
+    {"/api/send/preview", HTTP_POST, handleSendPreview},
     {"/api/send", HTTP_POST, handleSend},
     {"/api/sign", HTTP_POST, handleSign},
     {"/api/wipe", HTTP_POST, handleWipe},

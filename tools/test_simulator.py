@@ -1,4 +1,5 @@
 """Regression checks for the simulator HTTP boundary and wallet approval flows."""
+import base64
 import io
 import json
 import unittest
@@ -75,7 +76,7 @@ class SimulatorTests(unittest.TestCase):
         self.assertEqual(public["address"], "")
         self.assertEqual(public["rpc"], "")
         self.assertEqual(json.load(self.call("/api/state", token=token))["address"], simulator.ADDRESS)
-        for endpoint in ("ap-password", "network", "lock", "request/reject", "wipe", "sign", "send"):
+        for endpoint in ("ap-password", "network", "lock", "request/reject", "wipe", "sign", "send", "send/preview"):
             self.assertEqual(self.call("/api/" + endpoint, {}).status, 401, endpoint)
         self.assertEqual(self.call("/api/setup/finish", {}).status, 409)
         self.clock.return_value += 299
@@ -264,7 +265,16 @@ class SimulatorTests(unittest.TestCase):
     def test_transfer_review_and_broadcast(self):
         token = self.login()
         bh = "1" * 32
-        req = json.load(self.call("/api/send", {"to": simulator.USDC, "amount": "0.1", "blockhash": bh}, token=token))["request"]
+        transfer = {"to": simulator.USDC, "amount": "0.1", "blockhash": bh}
+        quote = json.load(self.call("/api/send/preview", transfer, token=token))
+        self.assertCountEqual(quote, ["message", "amountUnits"])
+        self.assertEqual(quote["amountUnits"], "100000000")
+        self.assertEqual(self.dev.chain.call("getFeeForMessage", [quote["message"]])["value"], 5000)
+        self.assertIsNone(self.dev.req)
+        self.assertIsNone(self.dev.chain.signed)
+        req = json.load(self.call("/api/send", transfer, token=token))["request"]
+        self.assertEqual(json.load(self.call("/api/send/preview", transfer, token=token)), quote)
+        self.assertEqual(self.dev.req["id"], req["id"])
         self.press(1.6)
         self.assertEqual(self.dev.req["state"], "waiting")
         while self.dev.req["_page"] + 1 < self.dev.req["_pages"]:
@@ -283,6 +293,52 @@ class SimulatorTests(unittest.TestCase):
         self.clock.return_value += 2
         self.assertEqual(json.load(self.call("/rpc", lookup))["result"]["value"][0]["confirmationStatus"], "confirmed")
         self.assertEqual(self.dev.chain.lamports, 1_899_995_000)
+
+    def test_token_previews_match_first_and_repeat_transfer_cost(self):
+        token = self.login()
+        chain = self.dev.chain
+        for program, mint, size in ((simulator.TOKEN_PROGRAM, simulator.USDC, 165),
+                                    (simulator.TOKEN_2022_PROGRAM, simulator.TOKEN_2022_MINT, 170)):
+            with self.subTest(program=program):
+                transfer = {"to": "1" * 32, "amount": "2.5", "decimals": 6, "mint": mint,
+                            "program": program, "blockhash": "1" * 32}
+                quote = json.load(self.call("/api/send/preview", transfer, token=token))
+                dest = quote["destinationAccount"]
+                self.assertEqual(quote["amountUnits"], "2500000")
+                self.assertIsNone(chain.call("getAccountInfo", [dest])["value"])
+                if program == simulator.TOKEN_2022_PROGRAM:
+                    result = chain.call("simulateTransaction", [quote["sizeTransaction"]])["value"]
+                    self.assertIsNone(result["err"])
+                    self.assertEqual(result["returnData"]["programId"], program)
+                    raw, encoding = result["returnData"]["data"]
+                    self.assertEqual(encoding, "base64")
+                    self.assertEqual(base64.b64decode(raw), size.to_bytes(8, "little"))
+                else:
+                    self.assertNotIn("sizeTransaction", quote)
+
+                fee = chain.call("getFeeForMessage", [quote["message"]])["value"]
+                minimum = chain.call("getMinimumBalanceForRentExemption", [size])
+                # Partial funding is possible even before the ATA is initialized.
+                prefunded = 10000 if program == simulator.TOKEN_2022_PROGRAM else 0
+                if prefunded:
+                    chain.accounts[dest] = simulator.simulated_account(simulator.SYSTEM_PROGRAM, prefunded)
+                for cost in (fee + minimum - prefunded, fee):
+                    before = chain.lamports
+                    req = json.load(self.call("/api/send", transfer, token=token))["request"]
+                    while self.dev.req["_page"] + 1 < self.dev.req["_pages"]:
+                        self.press(0.2)
+                    self.press(1.6)
+                    signed = json.load(self.call("/api/request?id=" + str(req["id"]), token=token))["request"]
+                    wire = json.loads(base64.b64decode(signed["tx"]))
+                    self.assertEqual(wire["message"], json.loads(base64.b64decode(quote["message"])))
+                    with patch.object(chain, "lamports", cost - 1):
+                        with self.assertRaisesRegex(ValueError, "Insufficient balance"):
+                            chain.call("sendTransaction", [signed["tx"]])
+                    for _ in range(2):
+                        self.assertEqual(chain.call("sendTransaction", [signed["tx"]]), signed["signature"])
+                    self.assertEqual(before - chain.lamports, cost)
+                    account = chain.call("getAccountInfo", [dest])["value"]
+                    self.assertEqual((account["owner"], account["lamports"], account["space"]), (program, minimum, size))
 
 
 if __name__ == "__main__":

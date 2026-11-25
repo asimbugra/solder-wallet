@@ -28,6 +28,8 @@ Built on [Infratic-lib](https://github.com/infraticxyz-lab/Infratic-lib), the So
 
 Your phone needs mobile data (or a second network) for balances and sending. Creating a wallet, signing messages and all key handling work with no internet at all.
 
+In **Send**, enter the recipient and amount, then choose **Estimate cost**. The phone asks the selected network for the fee on the exact transfer message built by Solder. For token transfers, it also checks how much SOL is needed to open the recipient’s token account. The total shows token units and SOL separately. **Review on device** refreshes the estimate. If the cost changes, you can check the new amount before starting the BOOT approval.
+
 If transfer confirmation is interrupted, reopen Solder in the same browser and unlock the wallet on the original network. The browser keeps the public signature of each pending transfer and checks its status again. **Check again** looks up the same signature. **Done** returns to the wallet, where pending transfers remain available until confirmed, rejected or removed from tracking.
 
 ## Hardware
@@ -87,6 +89,7 @@ docs/SECURITY.md  what Solder protects against, and what it does not
 | `POST /api/setup/check` | OLED build: start the paper backup check or read its status using the setup token |
 | `POST /api/unlock`, `/api/lock` | PIN session |
 | `POST /api/send`, `/api/sign`, `/api/wipe` | create a request for the button |
+| `POST /api/send/preview` | build an unsigned transfer message for a fee estimate using the same fields as `/api/send` |
 | `GET /api/request`, `POST /api/request/reject` | follow or cancel it; a signed send returns the transaction |
 | `POST /api/network` | devnet, mainnet or your own RPC (used by the phone) |
 

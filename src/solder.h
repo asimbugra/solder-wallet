@@ -60,6 +60,13 @@ struct Request
     String error;
 };
 
+struct TransferPreview
+{
+    String message;               // base64-encoded unsigned message for getFeeForMessage
+    String destinationAccount;    // recipient's associated token account
+    String sizeTransaction;       // read-only Token-2022 account-size simulation
+};
+
 const char *reqKindName(ReqKind k);
 const char *reqStateName(ReqState s);
 
@@ -86,6 +93,7 @@ namespace solder
     bool finishSetup(const String &mnemonic, const String &pin, String &outError);
 
     // requests
+    bool previewTransfer(const Request &r, TransferPreview &preview);
     bool startRequest(Request &r, String &outError);
     void rejectRequest();
 

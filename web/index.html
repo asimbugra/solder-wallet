@@ -203,6 +203,10 @@ textarea.input { min-height: 120px; resize: vertical; line-height: 1.6; }
 .rows .main { font-family: var(--display); font-weight: 500; }
 .rows .sub { color: var(--silk-dim); font-size: 13px; }
 .rows .end { margin-left: auto; text-align: right; }
+.costs { margin: 0; }
+.costs > div { display: flex; justify-content: space-between; gap: 16px; padding: 7px 0; }
+.costs dd { margin: 0; text-align: right; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.costs > div:last-child { border-top: 1px solid var(--trace); font-weight: 700; }
 .rows a { text-decoration: none; }
 .via { width: 12px; height: 12px; border-radius: 50%; border: 3px solid var(--gold-dark); flex: none; }
 .via.bad { border-color: var(--led); }
@@ -418,8 +422,20 @@ textarea.input { min-height: 120px; resize: vertical; line-height: 1.6; }
       <label class="field"><span>Token</span><select class="input" id="sendToken"></select></label>
       <label class="field"><span>To</span><input class="input mono" id="sendTo" placeholder="Solana address" autocapitalize="none" autocomplete="off" spellcheck="false"></label>
       <label class="field"><span>Amount</span><input class="input mono" id="sendAmt" inputmode="decimal" placeholder="0.0" autocomplete="off"></label>
-      <div class="err" id="sendErr"></div>
-      <div class="stack"><button class="pad wide" id="sendBtn">Review on device</button></div>
+      <section class="section" id="sendCosts" aria-live="polite" hidden>
+        <h3>Estimated cost</h3>
+        <dl class="costs">
+          <div><dt>Transfer amount</dt><dd id="costAmount"></dd></div>
+          <div><dt>Network fee</dt><dd id="costFee"></dd></div>
+          <div id="costAccountRow" hidden><dt>Recipient token account</dt><dd id="costAccount"></dd></div>
+          <div><dt>Total from wallet</dt><dd id="costTotal"></dd></div>
+        </dl>
+      </section>
+      <div class="err" id="sendErr" role="status"></div>
+      <div class="stack">
+        <button class="pad wide" id="sendBtn">Estimate cost</button>
+        <button class="pad wide" id="reviewSendBtn" hidden>Review on device</button>
+      </div>
     </section>
 
     <!-- receive -->
@@ -623,6 +639,7 @@ function toast(text) {
 let current = "loading";
 function show(name, dir = "fwd", push = true) {
   if (name === current) return;
+  if (current === "send") clearSendEstimate();
   if (current === "approve") trackedTransfer = null;
   if (name === "welcome") forgetSetup();
   if (current === "appass") $("#apPass1").value = $("#apPass2").value = "";
@@ -699,6 +716,9 @@ async function refreshInfo() {
   const token = state.token;
   const info = await api("state");
   if (state.token !== token) return state.info;
+  if (current === "send" && (state.info.address !== info.address || state.info.rpc !== info.rpc || state.info.network !== info.network)) {
+    clearSendEstimate();
+  }
   state.info = info;
   paintHeader();
   return state.info;
@@ -1180,23 +1200,149 @@ function fillTokens() {
   sel.innerHTML = "<option value=''>SOL</option>";
   state.tokens.forEach((t) => { const o = document.createElement("option"); o.value = t.mint; o.textContent = shortAddr(t.mint) + " (" + t.amount + ")"; sel.appendChild(o); });
 }
-$("#sendBtn").onclick = async () => {
-  const b = $("#sendBtn");
+let sendRevision = 0, displayedEstimate = null;
+function clearSendEstimate() {
+  ++sendRevision;
+  displayedEstimate = null;
+  $("#sendCosts").hidden = $("#reviewSendBtn").hidden = true;
+  $("#sendBtn").hidden = $("#sendBtn").disabled = false;
+  $("#sendBtn").textContent = "Estimate cost";
+  $("#reviewSendBtn").disabled = false;
+  $("#reviewSendBtn").textContent = "Review on device";
+  for (const id of ["costAmount", "costFee", "costAccount", "costTotal"]) $("#" + id).textContent = "";
   $("#sendErr").textContent = "";
-  b.disabled = true;
+}
+$("#sendAmt").oninput = $("#sendTo").oninput = $("#sendToken").onchange = clearSendEstimate;
+
+function formatUnits(units, decimals) {
+  const digits = units.toString().padStart(decimals + 1, "0");
+  if (!decimals) return digits;
+  const fraction = digits.slice(-decimals).replace(/0+$/, "");
+  return digits.slice(0, -decimals) + (fraction ? "." + fraction : "");
+}
+function solCost(units) { return formatUnits(units, 9) + " SOL"; }
+function rpcLamports(value, field) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error("Could not determine " + field + " from this RPC.");
+  return BigInt(value);
+}
+
+async function recipientDeposit(preview, program, endpoint, config) {
+  if (!program) return { needed: false, deposit: 0n };
+  if (!preview.destinationAccount) throw new Error("Solder did not return the recipient token account.");
+  const result = await rpc("getAccountInfo", [preview.destinationAccount, {
+    ...config, encoding: "base64", dataSlice: { offset: 0, length: 0 },
+  }], endpoint);
+  const account = result.value;
+  if (account && account.owner === program && !account.executable && Number.isSafeInteger(account.space) && account.space >= 165) {
+    return { needed: false, deposit: 0n };
+  }
+  if (account !== null && !(account?.owner === "11111111111111111111111111111111" && account.space === 0 && !account.executable)) {
+    throw new Error("Cannot estimate creation of the recipient token account.");
+  }
+  const funded = account ? rpcLamports(account.lamports, "the recipient account balance") : 0n;
+  let size = 165; // Classic SPL Token account length.
+  if (program === SOL_TOKEN22) {
+    if (!preview.sizeTransaction) throw new Error("Missing Token-2022 account size query.");
+    const sim = await rpc("simulateTransaction", [preview.sizeTransaction, { ...config, encoding: "base64", sigVerify: false }], endpoint);
+    if (sim.value?.err === "InsufficientFundsForFee") {
+      throw new Error("Insufficient SOL for the network fee. The RPC could not estimate the token account deposit.");
+    }
+    const ret = sim.value?.returnData;
+    if (sim.value?.err || ret?.programId !== program || ret.data?.[1] !== "base64") {
+      throw new Error("Could not determine the account size for this Token-2022 mint.");
+    }
+    const bytes = Uint8Array.from(atob(ret.data[0]), c => c.charCodeAt(0));
+    if (bytes.length !== 8) throw new Error("Invalid token account size from the RPC.");
+    size = Number(new DataView(bytes.buffer).getBigUint64(0, true));
+    if (!Number.isSafeInteger(size) || size < 165 || size > 10485760) throw new Error("Invalid token account size from the RPC.");
+  }
+  const minimum = rpcLamports(await rpc("getMinimumBalanceForRentExemption", [size, { commitment: "confirmed" }], endpoint), "the token account deposit");
+  const target = minimum || 1n;
+  return { needed: true, deposit: funded < target ? target - funded : 0n };
+}
+
+function paintSendEstimate(estimate, draft) {
+  const { units, fee, deposit, needed, solTotal, balance } = estimate;
+  const amount = formatUnits(units, draft.decimals) + " " + (draft.mint ? shortAddr(draft.mint) : "SOL");
+  $("#costAmount").textContent = amount;
+  $("#costFee").textContent = solCost(fee);
+  $("#costAccountRow").hidden = !draft.mint;
+  $("#costAccount").textContent = needed ? solCost(deposit) + " to open" : "Already open · 0 SOL";
+  $("#costTotal").textContent = (draft.mint ? amount + " + " : "") + solCost(solTotal);
+  $("#sendCosts").hidden = false;
+  $("#reviewSendBtn").hidden = balance < solTotal;
+  $("#sendBtn").hidden = balance >= solTotal;
+  if (balance < solTotal) $("#sendErr").textContent = "Insufficient SOL. Available: " + solCost(balance) + ". Required: " + solCost(solTotal) + ".";
+}
+
+async function estimateSend(review) {
+  const previous = displayedEstimate;
+  const button = review ? $("#reviewSendBtn") : $("#sendBtn");
+  if (button.disabled || button.hidden || (review && !previous)) return;
+  const revision = ++sendRevision, session = state.token;
+  const { address, rpc: endpoint, network } = state.info;
+  const mint = $("#sendToken").value;
+  const token = state.tokens.find(t => t.mint === mint);
+  const draft = { to: $("#sendTo").value.trim(), amount: $("#sendAmt").value.trim(), mint,
+    decimals: token ? token.decimals : 9, program: token?.program };
+  const currentDraft = () => revision === sendRevision && current === "send" && state.token === session &&
+    state.info.address === address && state.info.rpc === endpoint && state.info.network === network &&
+    draft.to === $("#sendTo").value.trim() && draft.amount === $("#sendAmt").value.trim() && mint === $("#sendToken").value;
+  button.disabled = true;
+  button.textContent = review ? "Checking cost…" : "Estimating…";
+  $("#sendErr").textContent = "";
   try {
-    const mint = $("#sendToken").value;
-    const t = state.tokens.find((x) => x.mint === mint);
-    const endpoint = state.info.rpc, session = state.token;
-    const to = $("#sendTo").value.trim(), amount = $("#sendAmt").value.trim();
+    if (!draft.to || !draft.amount || (mint && !token)) throw new Error("Choose a token and enter a recipient and amount.");
     const bh = await rpc("getLatestBlockhash", [{ commitment: "confirmed" }], endpoint);
-    if (current !== "send" || state.token !== session || endpoint !== state.info.rpc) return;
-    const r = await api("send", { to, amount, mint, decimals: t ? t.decimals : 9, program: t ? t.program : undefined, blockhash: bh.value.blockhash });
-    if (current !== "send" || state.token !== session || endpoint !== state.info.rpc) return;
-    startApproval(r.request, endpoint);
-  } catch (e) { $("#sendErr").textContent = e.message; }
-  finally { b.disabled = false; }
-};
+    if (!currentDraft()) return;
+    draft.blockhash = bh.value.blockhash;
+    const config = { commitment: "confirmed", minContextSlot: bh.context.slot };
+    const preview = await api("send/preview", draft);
+    if (!currentDraft()) return;
+    if (!preview.message || typeof preview.amountUnits !== "string" || !/^[1-9][0-9]*$/.test(preview.amountUnits)) {
+      throw new Error("Could not read the transfer estimate from Solder.");
+    }
+    const [feeReply, balanceReply, account] = await Promise.all([
+      rpc("getFeeForMessage", [preview.message, config], endpoint),
+      rpc("getBalance", [address, config], endpoint),
+      recipientDeposit(preview, draft.program, endpoint, config),
+    ]);
+    if (!currentDraft()) return;
+    const units = BigInt(preview.amountUnits), fee = rpcLamports(feeReply.value, "the network fee");
+    const balance = rpcLamports(balanceReply.value, "the SOL balance");
+    const solTotal = fee + account.deposit + (mint ? 0n : units);
+    displayedEstimate = { units, fee, ...account, balance, solTotal, to: draft.to, mint, endpoint, network };
+    paintSendEstimate(displayedEstimate, draft);
+    if (!review || balance < solTotal) return;
+    if (previous.fee !== fee || previous.deposit !== account.deposit || previous.needed !== account.needed || previous.units !== units ||
+        previous.to !== draft.to || previous.mint !== mint || previous.endpoint !== endpoint || previous.network !== network) {
+      $("#sendErr").textContent = "The estimate changed. Review the updated cost to continue.";
+      return;
+    }
+    // Use the exact fields and recent blockhash whose fee was just quoted.
+    const form = $("#v-send"), settings = $("#settingsBtn");
+    form.inert = settings.disabled = true;
+    try {
+      const r = await api("send", draft);
+      if (state.token !== session || state.info.address !== address) return;
+      if (state.info.network === network && state.info.rpc === endpoint) startApproval(r.request, endpoint);
+      else await api("request/reject", { id: r.request.id });
+    } finally { form.inert = settings.disabled = false; }
+  } catch (e) {
+    if (currentDraft()) {
+      clearSendEstimate();
+      $("#sendErr").textContent = e.message + " Check costs again to continue.";
+    }
+  } finally {
+    if (revision === sendRevision && !currentDraft()) clearSendEstimate();
+    if (revision === sendRevision) {
+      button.disabled = false;
+      button.textContent = review ? "Review on device" : "Estimate cost";
+    }
+  }
+}
+$("#sendBtn").onclick = () => estimateSend(false);
+$("#reviewSendBtn").onclick = () => estimateSend(true);
 $("#signBtn").onclick = async () => {
   $("#signErr").textContent = "";
   try { const r = await api("sign", { message: $("#signMsg").value }); startApproval(r.request); }

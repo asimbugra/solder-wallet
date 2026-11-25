@@ -11,6 +11,7 @@ Nothing here touches a real network or real keys.
 """
 import argparse
 import base64
+import hashlib
 import json
 import random
 import re
@@ -31,6 +32,12 @@ WORDS = ("orbit velvet canyon harbor lantern meadow pilot ribbon silver tunnel w
          "breeze cactus dragon ember falcon glacier hollow island jungle kettle marble nectar").split()
 ADDRESS = "SoLdR7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJ"
 USDC = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+TOKEN_2022_MINT = "3PUZhUoTb8vtVBWAQcB8U79RR5JrahfZhAxB537aGM5o"
+TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+SYSTEM_PROGRAM = "1" * 32
+NETWORK_FEE = 5000
+TOKEN_FIXTURES = {TOKEN_PROGRAM: (USDC, 165), TOKEN_2022_PROGRAM: (TOKEN_2022_MINT, 170)}
 ASSETS = {"/vendor/" + f.name: f for f in (WEB / "vendor").iterdir()
           if f.is_file() and not f.is_symlink() and f.suffix in (".woff2", ".js")}
 
@@ -39,24 +46,77 @@ def b58(n):
     return "".join(random.choice(B58) for _ in range(n))
 
 
+def simulated_ata(owner, mint, program):
+    # A stable stand-in for an associated account on this local chain.
+    digest = hashlib.sha256(f"{owner}/{mint}/{program}".encode()).digest()
+    number = int.from_bytes(digest, "big")
+    encoded = ""
+    while number:
+        number, digit = divmod(number, 58)
+        encoded = B58[digit] + encoded
+    return "1" * (len(digest) - len(digest.lstrip(b"\0"))) + encoded
+
+
+def pack_message(message):
+    return base64.b64encode(json.dumps(message, separators=(",", ":")).encode()).decode()
+
+
+def rent_exempt_minimum(size):
+    # Fixed simulator rent schedule, shared by the quote and fake ledger.
+    return (size + 128) * 6960
+
+
+def simulated_account(owner, lamports, size=0):
+    return {"owner": owner, "lamports": lamports, "space": size, "data": ["", "base64"], "executable": False}
+
+
 class Chain:
     """Just enough of a Solana RPC for the wallet page."""
 
     def __init__(self):
         self.lamports = 0
         self.history = deque(maxlen=100)     # (signature, time, err)
-        self.pending = {}          # signature -> confirm time
+        self.pending = {}          # signature -> (confirm time, submitted transaction)
         self.signed = None         # most recent unbroadcast simulated transaction
+        self.accounts = {}         # funded recipients, including associated token accounts
+        self.tokens = {USDC: 125_500_000, TOKEN_2022_MINT: 50_000_000}  # 6 decimals for both fixtures
 
     def call(self, method, params):
         now = time.time()
         if method == "getBalance":
-            return {"context": {"slot": 1}, "value": self.lamports}
+            balance = self.lamports if params[0] == ADDRESS else self.accounts.get(params[0], {}).get("lamports", 0)
+            return {"context": {"slot": 1}, "value": balance}
         if method == "getTokenAccountsByOwner":
-            if params[1].get("programId", "").startswith("Tokenkeg") and self.lamports:
-                info = {"mint": USDC, "tokenAmount": {"amount": "125500000", "decimals": 6, "uiAmountString": "125.5"}}
-                return {"value": [{"account": {"data": {"parsed": {"info": info}}}}]}
+            program = params[1].get("programId")
+            if params[0] == ADDRESS and program in TOKEN_FIXTURES and self.lamports:
+                mint, _ = TOKEN_FIXTURES[program]
+                units = self.tokens[mint]
+                whole, frac = divmod(units, 1_000_000)
+                ui_amount = f"{whole}.{frac:06}".rstrip("0").rstrip(".")
+                info = {"mint": mint, "tokenAmount": {"amount": str(units), "decimals": 6, "uiAmountString": ui_amount}}
+                return {"value": [{"pubkey": simulated_ata(ADDRESS, mint, program),
+                                   "account": {"data": {"parsed": {"info": info}}}}]}
             return {"value": []}
+        if method == "getFeeForMessage":
+            message = json.loads(base64.b64decode(params[0], validate=True))
+            if message.get("kind") not in ("send", "send-token"):
+                raise ValueError("Unknown simulated transfer")
+            return {"context": {"slot": 1}, "value": NETWORK_FEE}
+        if method == "getAccountInfo":
+            return {"context": {"slot": 1}, "value": self.accounts.get(params[0])}
+        if method == "getMinimumBalanceForRentExemption":
+            size = params[0]
+            if type(size) is not int or not 0 <= size <= 10_485_760:
+                raise ValueError("Invalid account size")
+            return rent_exempt_minimum(size)
+        if method == "simulateTransaction":
+            message = json.loads(base64.b64decode(params[0], validate=True))
+            if message.get("kind") != "GetAccountDataSize" or message.get("mint") != TOKEN_2022_MINT:
+                raise ValueError("Unknown simulated sizing query")
+            account_size = TOKEN_FIXTURES[TOKEN_2022_PROGRAM][1]
+            size = base64.b64encode(account_size.to_bytes(8, "little")).decode()
+            return {"context": {"slot": 1}, "value": {"err": None,
+                    "returnData": {"programId": TOKEN_2022_PROGRAM, "data": [size, "base64"]}}}
         if method == "getSignaturesForAddress":
             return [{"signature": s, "blockTime": int(t), "err": e} for s, t, e in reversed(self.history)][:10]
         if method == "requestAirdrop":
@@ -69,24 +129,45 @@ class Chain:
         if method == "getLatestBlockhash":
             return {"context": {"slot": 1}, "value": {"blockhash": b58(44), "lastValidBlockHeight": 1000}}
         if method == "sendTransaction":
+            for sig, (_, submitted) in self.pending.items():
+                if params[0] == submitted:
+                    return sig
             if self.signed is None or params[0] != self.signed[0]:
                 raise ValueError("No matching signed transaction")
-            _, sig, lamports = self.signed
-            if sig in self.pending:
-                return sig
-            if self.lamports < lamports + 5000:
+            _, sig, transfer = self.signed
+            mint, program, dest = transfer["mint"], transfer["program"], transfer["to"]
+            units = transfer["units"]
+            sol_out = units
+            if mint:
+                fixture_mint, size = TOKEN_FIXTURES[program]
+                if mint != fixture_mint or transfer["decimals"] != 6 or self.tokens[mint] < units:
+                    raise ValueError("Invalid token or insufficient token balance")
+                dest = simulated_ata(dest, mint, program)
+                existing = self.accounts.get(dest, {})
+                if existing.get("owner") == program:
+                    sol_out = 0
+                elif not existing or (existing["owner"] == SYSTEM_PROGRAM and existing["space"] == 0):
+                    sol_out = max(0, rent_exempt_minimum(size) - existing.get("lamports", 0))
+                else:
+                    raise ValueError("Cannot create recipient token account")
+            if self.lamports < sol_out + NETWORK_FEE:
                 raise ValueError("Insufficient balance")
-            self.lamports -= lamports + 5000
+            self.lamports -= sol_out + NETWORK_FEE
+            account = self.accounts.setdefault(dest, simulated_account(SYSTEM_PROGRAM, 0))
+            account["lamports"] += sol_out
+            if mint:
+                self.tokens[mint] -= units
+                account.update({"owner": program, "space": size})
             if len(self.pending) >= 100:
                 del self.pending[next(iter(self.pending))]
-            self.pending[sig] = now + 1.4
+            self.pending[sig] = (now + 1.4, params[0])
             self.history.append((sig, now, None))
             return sig
         if method == "getSignatureStatuses":
             out = []
             for s in params[0]:
-                t = self.pending.get(s)
-                out.append(None if t is None else {"confirmationStatus": "confirmed" if now >= t else "processed", "err": None})
+                receipt = self.pending.get(s)
+                out.append(None if receipt is None else {"confirmationStatus": "confirmed" if now >= receipt[0] else "processed", "err": None})
             return {"value": out}
         raise ValueError("method not simulated: " + method)
 
@@ -315,10 +396,9 @@ class Device:
         else:
             sig = b58(88)
             r["signature"] = sig
-            lamports = r["_amount"] if r["kind"] == "send" else 0
-            # a stand-in for the signed transaction: the fake chain reads it back
-            r["tx"] = base64.b64encode(json.dumps({"signature": sig, "lamports": lamports}).encode()).decode()
-            self.chain.signed = (r["tx"], sig, lamports)
+            transfer = r["_transfer"]
+            r["tx"] = pack_message({"signature": sig, "message": transfer})
+            self.chain.signed = (r["tx"], sig, transfer)
         r["state"] = "done"
         self.paint()
 
@@ -687,13 +767,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 d.end_session()
                 self.send_json(200, {"ok": True})
-            elif p in ("/api/send", "/api/sign", "/api/wipe"):
+            elif p in ("/api/send", "/api/send/preview", "/api/sign", "/api/wipe"):
                 if not self.session():
                     return
-                if d.req and d.req["state"] == "waiting":
+                if p != "/api/send/preview" and d.req and d.req["state"] == "waiting":
                     self.send_json(409, {"error": "Another request is waiting for the button"})
                     return
-                if p == "/api/send":
+                if p in ("/api/send", "/api/send/preview"):
                     to, amt, bh = b.get("to", ""), b.get("amount", ""), b.get("blockhash", "")
                     if not isinstance(to, str) or not re.fullmatch(f"[{B58}]{{32,44}}", to) or to == ADDRESS:
                         self.send_json(400, {"error": "That is not a Solana address"})
@@ -701,10 +781,14 @@ class Handler(BaseHTTPRequestHandler):
                     if not isinstance(bh, str) or not re.fullmatch(f"[{B58}]{{32,44}}", bh):
                         self.send_json(400, {"error": "Missing recent blockhash, is your phone online?"})
                         return
-                    mint = b.get("mint") or ""
-                    decimals = b.get("decimals", 0) if mint else 9
-                    if mint and (not isinstance(mint, str) or not re.fullmatch(f"[{B58}]{{32,44}}", mint)
-                                 or type(decimals) is not int or not 0 <= decimals <= 18):
+                    mint = b.get("mint", "")
+                    if not isinstance(mint, str):
+                        self.send_json(400, {"error": "Invalid token mint"})
+                        return
+                    decimals = b.get("decimals") if mint else 9
+                    program = b.get("program", TOKEN_PROGRAM) if mint else ""
+                    if mint and (not re.fullmatch(f"[{B58}]{{32,44}}", mint) or type(decimals) is not int
+                                 or not 0 <= decimals <= 18 or program not in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM)):
                         self.send_json(400, {"error": "Unknown token"})
                         return
                     if not isinstance(amt, str) or not re.fullmatch(r"[0-9]{0,20}([.,][0-9]{0,18})?", amt):
@@ -715,8 +799,18 @@ class Handler(BaseHTTPRequestHandler):
                     if len(frac) > decimals or not 0 < units <= 2**64 - 1:
                         self.send_json(400, {"error": "Invalid amount"})
                         return
-                    req = {"kind": "send-token" if mint else "send", "to": to, "amount": amt.replace(",", "."),
-                           "symbol": mint[:4] if mint else "SOL", "mint": mint, "_amount": units}
+                    transfer = {"kind": "send-token" if mint else "send", "to": to, "mint": mint, "program": program,
+                                "decimals": decimals, "units": units, "blockhash": bh}
+                    if p == "/api/send/preview":
+                        quote = {"amountUnits": str(units), "message": pack_message(transfer)}
+                        if mint:
+                            quote["destinationAccount"] = simulated_ata(to, mint, program)
+                        if program == TOKEN_2022_PROGRAM:
+                            quote["sizeTransaction"] = pack_message({"kind": "GetAccountDataSize", "mint": mint, "blockhash": bh})
+                        self.send_json(200, quote)
+                        return
+                    req = {"kind": transfer["kind"], "to": to, "amount": amt.replace(",", "."),
+                           "symbol": mint[:4] if mint else "SOL", "mint": mint, "_transfer": transfer}
                 elif p == "/api/sign":
                     message = b.get("message")
                     if (not isinstance(message, str) or not message or ord(message[0]) < 32

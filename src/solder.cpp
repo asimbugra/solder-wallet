@@ -601,6 +601,61 @@ namespace solder
         showIdle();
     }
 
+    // The fee quote and the BOOT-approved signature use the same message builder.
+    static bool buildTransfer(const Request &r, Transaction &tx, String &destinationAccount)
+    {
+        tx.fee_payer = wallet.pubkey();
+        tx.recent_blockhash = r.blockhash;
+        Pubkey to = Pubkey::fromBase58(r.to);
+        if (r.kind == ReqKind::SendSol)
+        {
+            std::vector<uint8_t> data = {2, 0, 0, 0};
+            for (int i = 0; i < 8; i++) data.push_back((uint8_t)(r.amount >> (8 * i)));
+            tx.add(Instruction(Pubkey::fromBase58(INFRATIC_SYSTEM_PROGRAM_ID),
+                               {AccountMeta::writable(wallet.pubkey(), true), AccountMeta::writable(to)}, data));
+        }
+        else
+        {
+            String src;
+            if (!offline.getAssociatedTokenAddress(wallet.publicBase58(), r.mint, src, r.tokenProgram) ||
+                !offline.getAssociatedTokenAddress(r.to, r.mint, destinationAccount, r.tokenProgram))
+            {
+                return false;
+            }
+            Pubkey mint = Pubkey::fromBase58(r.mint), prog = Pubkey::fromBase58(r.tokenProgram);
+            Pubkey dstAta = Pubkey::fromBase58(destinationAccount);
+            tx.add(Infratic::createAssociatedTokenAccountIdempotentIx(wallet.pubkey(), dstAta, to, mint, prog));
+            tx.add(Infratic::transferCheckedIx(Pubkey::fromBase58(src), mint, dstAta, wallet.pubkey(),
+                                               r.amount, r.decimals, prog));
+        }
+        return true;
+    }
+
+    bool previewTransfer(const Request &r, TransferPreview &preview)
+    {
+        Transaction tx;
+        if (!buildTransfer(r, tx, preview.destinationAccount)) return false;
+        const auto bytes = tx.serializeMessage();
+        if (bytes.empty()) return false;
+        preview.message = offline.base64Encode(bytes.data(), bytes.size());
+        if (!preview.message.length()) return false;
+
+        if (r.tokenProgram == INFRATIC_TOKEN_2022_PROGRAM_ID)
+        {
+            // ATA creation asks GetAccountDataSize (21) for ImmutableOwner (u16 LE, 7).
+            // The token program also accounts for extensions required by the mint.
+            Transaction sizeQuery;
+            sizeQuery.fee_payer = tx.fee_payer;
+            sizeQuery.recent_blockhash = tx.recent_blockhash;
+            sizeQuery.add(Instruction(Pubkey::fromBase58(r.tokenProgram),
+                                      {{Pubkey::fromBase58(r.mint), false, false}}, {21, 7, 0}));
+            sizeQuery.signature.resize(64, 0); // RPC simulation with sigVerify disabled
+            preview.sizeTransaction = sizeQuery.serializeBase64();
+            if (!preview.sizeTransaction.length()) return false;
+        }
+        return true;
+    }
+
     // Runs right after the button was held. Signing takes a few milliseconds.
     static void execute()
     {
@@ -637,34 +692,13 @@ namespace solder
             return;
         }
 
-        // Solder builds the transaction itself from what it showed you, the browser
-        // only supplies the recent blockhash.
         Transaction tx;
-        tx.fee_payer = wallet.pubkey();
-        tx.recent_blockhash = r.blockhash;
-        Pubkey to = Pubkey::fromBase58(r.to);
-        if (r.kind == ReqKind::SendSol)
+        String destinationAccount;
+        if (!buildTransfer(r, tx, destinationAccount))
         {
-            std::vector<uint8_t> data = {2, 0, 0, 0};
-            for (int i = 0; i < 8; i++) data.push_back((uint8_t)(r.amount >> (8 * i)));
-            tx.add(Instruction(Pubkey::fromBase58(INFRATIC_SYSTEM_PROGRAM_ID),
-                               {AccountMeta::writable(wallet.pubkey(), true), AccountMeta::writable(to)}, data));
-        }
-        else
-        {
-            String src, dst;
-            if (!offline.getAssociatedTokenAddress(wallet.publicBase58(), r.mint, src, r.tokenProgram) ||
-                !offline.getAssociatedTokenAddress(r.to, r.mint, dst, r.tokenProgram))
-            {
-                r.error = "Could not derive token accounts";
-                r.state = ReqState::Failed;
-                return;
-            }
-            Pubkey mint = Pubkey::fromBase58(r.mint), prog = Pubkey::fromBase58(r.tokenProgram);
-            Pubkey dstAta = Pubkey::fromBase58(dst);
-            tx.add(Infratic::createAssociatedTokenAccountIdempotentIx(wallet.pubkey(), dstAta, to, mint, prog));
-            tx.add(Infratic::transferCheckedIx(Pubkey::fromBase58(src), mint, dstAta, wallet.pubkey(),
-                                               r.amount, r.decimals, prog));
+            r.error = "Could not derive token accounts";
+            r.state = ReqState::Failed;
+            return;
         }
 
         // Move the live key into the list required by the signing API. An
