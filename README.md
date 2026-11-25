@@ -28,6 +28,8 @@ Built on [Infratic-lib](https://github.com/infraticxyz-lab/Infratic-lib), the So
 
 Your phone needs mobile data (or a second network) for balances and sending. Creating a wallet, signing messages and all key handling work with no internet at all.
 
+In **Receive**, enter an optional SOL amount to create a payment request. For example, entering `0.25` produces a QR code for `solana:<address>?amount=0.25`. Scan it with a Solana Pay-compatible wallet or choose **Copy payment request** to share the link. The payer selects the same network in their wallet. Leave the amount empty to share just your address. Creating the QR works offline.
+
 In **Send**, enter the recipient and amount, then choose **Estimate cost**. The phone asks the selected network for the fee on the exact transfer message built by Solder. For token transfers, it also checks how much SOL is needed to open the recipient’s token account. The total shows token units and SOL separately. **Review on device** refreshes the estimate. If the cost changes, you can check the new amount before starting the BOOT approval.
 
 If transfer confirmation is interrupted, reopen Solder in the same browser and unlock the wallet on the original network. The browser keeps the public signature of each pending transfer and checks its status again. **Check again** looks up the same signature. **Done** returns to the wallet, where pending transfers remain available until confirmed, rejected or removed from tracking.

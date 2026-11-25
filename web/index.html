@@ -442,7 +442,11 @@ textarea.input { min-height: 120px; resize: vertical; line-height: 1.6; }
     <section class="view" id="v-receive">
       <button class="back" data-back>‹ Back</button>
       <h2>Receive</h2>
-      <p class="lede">Send SOL or tokens to this address<span id="recvNet"></span>.</p>
+      <p class="lede" id="recvNote"></p>
+      <label class="field"><span>Request amount in SOL (optional)</span>
+        <input class="input mono" id="recvAmount" inputmode="decimal" placeholder="0.25" autocomplete="off" aria-describedby="recvAmountErr">
+      </label>
+      <div class="err" id="recvAmountErr" role="status" hidden></div>
       <div class="qr" id="qr"></div>
       <div class="full-addr" id="fullAddr"></div>
       <div class="stack"><button class="pad wide" id="copyBtn">Copy address</button></div>
@@ -640,6 +644,7 @@ let current = "loading";
 function show(name, dir = "fwd", push = true) {
   if (name === current) return;
   if (current === "send") clearSendEstimate();
+  if (current === "receive") clearReceive();
   if (current === "approve") trackedTransfer = null;
   if (name === "welcome") forgetSetup();
   if (current === "appass") $("#apPass1").value = $("#apPass2").value = "";
@@ -719,7 +724,10 @@ async function refreshInfo() {
   if (current === "send" && (state.info.address !== info.address || state.info.rpc !== info.rpc || state.info.network !== info.network)) {
     clearSendEstimate();
   }
+  const receiveChanged = current === "receive" && (state.info.address !== info.address ||
+    state.info.network !== info.network || state.info.rpc !== info.rpc);
   state.info = info;
+  if (receiveChanged) { clearReceive(); paintQr(); }
   paintHeader();
   return state.info;
 }
@@ -1175,11 +1183,26 @@ async function loadHome() {
 }
 
 $("#addrBtn").onclick = () => copy(state.info.address, $("#addrBtn"));
-$("#copyBtn").onclick = () => copy(state.info.address, $("#copyBtn"));
-function copy(text, el) {
-  const done = () => { toast("Address copied"); el.classList.add("copied"); setTimeout(() => el.classList.remove("copied"), 1200); };
-  if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done);
-  else { const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t); t.select(); document.execCommand("copy"); t.remove(); done(); }
+$("#copyBtn").onclick = () => {
+  const button = $("#copyBtn");
+  if (current === "receive" && !button.disabled && button.value) {
+    copy(button.value, button, button.value === state.info.address ? "Address copied" : "Payment request copied");
+  }
+};
+async function copy(text, el, message = "Address copied") {
+  try {
+    if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
+    else {
+      const field = document.createElement("textarea");
+      field.value = text;
+      document.body.appendChild(field);
+      try { field.select(); if (!document.execCommand("copy")) throw new Error(); }
+      finally { field.remove(); el.focus(); }
+    }
+    toast(message);
+    el.classList.add("copied");
+    setTimeout(() => el.classList.remove("copied"), 1200);
+  } catch { toast("Could not copy to the clipboard."); }
 }
 $("#lockBtn").onclick = async () => {
   try { await api("lock", {}); }
@@ -1632,16 +1655,50 @@ $("#doneBtn").onclick = async () => {
 };
 
 // ---------- receive ------------------------------------------------------
+function clearReceive() {
+  $("#recvAmount").value = $("#copyBtn").value = "";
+  $("#qr").replaceChildren();
+  $("#fullAddr").textContent = $("#recvNote").textContent = "";
+}
+
+function requestAmount(raw) {
+  const text = raw.trim();
+  if (!text) return "";
+  const match = /^(\d*)(?:[.,](\d{0,9}))?$/.exec(text);
+  if (!match) return null;
+  const whole = match[1].replace(/^0+/, "");
+  if (whole.length > 11) return null;
+  const units = BigInt(whole + (match[2] || "").padEnd(9, "0"));
+  return units > 0n && units <= 0xffffffffffffffffn ? formatUnits(units, 9) : null;
+}
+
+$("#recvAmount").oninput = paintQr;
 function paintQr() {
+  const { address, network } = state.info;
+  const amount = requestAmount($("#recvAmount").value);
+  const valid = amount !== null;
+  const button = $("#copyBtn"), qr = $("#qr");
+  $("#fullAddr").textContent = address;
+  $("#recvNote").textContent = amount
+    ? "Request " + amount + " SOL. The payer should select " + (network === "custom" ? "the same custom network" : network) + " in their wallet."
+    : "Send SOL or tokens to this address" + (network === "mainnet" ? "." : " on " + network + ".");
+  $("#recvAmount").setAttribute("aria-invalid", String(!valid));
+  $("#recvAmountErr").hidden = valid;
+  $("#recvAmountErr").textContent = valid ? "" : "Enter a positive SOL amount up to 18446744073.709551615, with at most 9 decimal places.";
+  button.textContent = amount === "" ? "Copy address" : "Copy payment request";
+  qr.hidden = button.disabled = !valid || !address;
+  button.value = "";
+  qr.replaceChildren();
+  if (button.disabled) return;
+  const uri = "solana:" + address + (amount ? "?amount=" + amount : "");
   const q = qrcode(0, "M");
-  q.addData("solana:" + state.info.address);
+  q.addData(uri);
   q.make();
   const n = q.getModuleCount();
   let d = "";
   for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) if (q.isDark(y, x)) d += `M${x} ${y}h1v1h-1z`;
-  $("#qr").innerHTML = `<svg viewBox="0 0 ${n} ${n}" shape-rendering="crispEdges"><path d="${d}" fill="#092519"/></svg>`;
-  $("#fullAddr").textContent = state.info.address;
-  $("#recvNet").textContent = state.info.network === "mainnet" ? "" : " on " + state.info.network;
+  qr.innerHTML = `<svg role="img" aria-label="Scan to pay" viewBox="-4 -4 ${n + 8} ${n + 8}" shape-rendering="crispEdges"><path d="${d}" fill="#092519"/></svg>`;
+  button.value = amount ? uri : address;
 }
 
 // ---------- settings -----------------------------------------------------
